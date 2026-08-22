@@ -1,0 +1,217 @@
+// TaskFlow database schema.
+// Cascade/restrict rationale is documented per-relation below and in docs/database.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrgRole {
+  org_admin
+  member
+}
+
+enum TaskStatus {
+  todo
+  in_progress
+  review
+  done
+}
+
+enum TaskPriority {
+  low
+  medium
+  high
+  urgent
+}
+
+enum OutboxStatus {
+  pending
+  dispatched
+  failed
+}
+
+// ---------------------------------------------------------------------------
+// Users are global identities. A user can belong to multiple organizations
+// via OrgMember. We RESTRICT deletes of a user that still has memberships,
+// assignments, or comments so we never silently orphan audit/history data —
+// deactivation (a future `is_active` flag) is the intended path, not hard delete.
+// ---------------------------------------------------------------------------
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  memberships       OrgMember[]
+  refreshTokens      RefreshToken[]
+  assignedTasks      TaskAssignment[] @relation("AssignedTasks")
+  comments           Comment[]
+
+  @@map("users")
+}
+
+// Refresh tokens are stored as a SHA-256 hash (never plaintext) so a DB read
+// alone cannot be used to impersonate a session. `revokedAt` supports both
+// single-session logout and "logout all devices" (bulk revoke by userId).
+model RefreshToken {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  tokenHash    String    @unique @map("token_hash")
+  // Points to the token that replaced this one when rotation occurs, enabling
+  // reuse-detection (if a rotated-out token is presented again, we know it's stolen).
+  replacedById String?   @map("replaced_by_id")
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// Organizations are the tenant boundary. Every org-owned resource ultimately
+// traces back to organization_id.
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  members  OrgMember[]
+  projects Project[]
+
+  @@map("organizations")
+}
+
+// Explicit membership table (not a role column on User) because a user can
+// belong to more than one org, and each membership carries its own role.
+model OrgMember {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  userId         String   @map("user_id")
+  role           OrgRole  @default(member)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Supports the core "is user X a member of org Y, and with what role" lookup
+  // that runs on nearly every authenticated request.
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@map("org_members")
+}
+
+// Deleting an organization cascades to its projects — an org-less project is
+// meaningless and orgs are only deleted in exceptional admin scenarios.
+model Project {
+  id             String    @id @default(uuid())
+  organizationId String    @map("organization_id")
+  name           String
+  description    String?
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  tasks        Task[]
+
+  // Supports "list projects for my org" (the primary project listing query).
+  @@index([organizationId])
+  @@map("projects")
+}
+
+// Deleting a project cascades to its tasks — a task cannot exist without its
+// project (and the project already enforces the org boundary).
+model Task {
+  id          String       @id @default(uuid())
+  projectId   String       @map("project_id")
+  title       String
+  description String?
+  status      TaskStatus   @default(todo)
+  priority    TaskPriority @default(medium)
+  dueDate     DateTime?    @map("due_date")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  deletedAt   DateTime?    @map("deleted_at")
+
+  project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignments TaskAssignment[]
+  comments    Comment[]
+
+  // Supports the task-list-by-project query (every task list request is
+  // scoped to a project).
+  @@index([projectId])
+  // Supports filtering by status/priority within a project (dashboard + filters).
+  @@index([projectId, status])
+  @@index([projectId, priority])
+  // Supports the due-date-range filter.
+  @@index([dueDate])
+  @@map("tasks")
+}
+
+// Assignment is many-to-many between tasks and users, but modeled as its own
+// table (not an implicit join) so it can carry metadata (assignedAt) and be
+// referenced by the notification outbox.
+model TaskAssignment {
+  id         String   @id @default(uuid())
+  taskId     String   @map("task_id")
+  userId     String   @map("user_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  // RESTRICT: a task assignment is a historical fact tied to a specific task.
+  // If the task is deleted, cascading is fine (handled above via Task->onDelete: Cascade
+  // through the FK on this side); if a user is deleted, RESTRICT to preserve
+  // assignment history unless explicitly reassigned/cleaned up first.
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user User @relation("AssignedTasks", fields: [userId], references: [id], onDelete: Restrict)
+
+  // Enforces "a user can only be assigned to a given task once" at the DB level.
+  @@unique([taskId, userId])
+  // Supports "what tasks is this user assigned to" queries.
+  @@index([userId])
+  @@map("task_assignments")
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  taskId    String   @map("task_id")
+  authorId  String   @map("author_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  // Supports "list comments for a task" (the only comment listing query).
+  @@index([taskId])
+  @@map("comments")
+}
+
+// Transactional outbox for the assignment -> notification flow. Written in
+// the SAME DB transaction as the TaskAssignment row, so it is durable even if
+// the immediate BullMQ enqueue attempt (done right after commit) fails. A
+// background recovery sweep in the worker publishes any row still `pending`
+// after a short grace period. See docs/technical-decisions.md.
+model NotificationOutbox {
+  id           String       @id @default(uuid())
+  taskId       String       @map("task_id")
+  assigneeId   String       @map("assignee_id")
+  status       OutboxStatus @default(pending)
+  attempts     Int          @default(0)
+  lastError    String?      @map("last_error")
+  createdAt    DateTime     @default(now()) @map("created_at")
+  dispatchedAt DateTime?    @map("dispatched_at")
+
+  // Supports the recovery sweep's "find pending rows older than N seconds" query.
+  @@index([status, createdAt])
+  @@map("notification_outbox")
+}

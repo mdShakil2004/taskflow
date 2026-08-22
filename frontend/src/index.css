@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-ink-line;
+  }
+  body {
+    @apply bg-ink text-paper;
+  }
+  ::selection {
+    @apply bg-signal-blue/30 text-paper;
+  }
+  /* Visible keyboard focus everywhere — never suppressed. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-signal-blue ring-offset-2 ring-offset-ink;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-ink-panel border border-ink-line rounded-lg shadow-panel;
+  }
+  .field {
+    @apply w-full rounded-md bg-ink border border-ink-line px-3 py-2 text-sm text-paper placeholder:text-paper-faint
+      focus:border-signal-blue outline-none transition-colors;
+  }
+  .label {
+    @apply block text-xs font-medium uppercase tracking-wide text-paper-muted mb-1.5;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3.5 py-2 text-sm font-medium
+      transition-colors disabled:opacity-40 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply btn bg-signal-blue text-white hover:bg-signal-blue/90;
+  }
+  .btn-secondary {
+    @apply btn bg-ink-raised text-paper border border-ink-line hover:bg-ink-line;
+  }
+  .btn-danger {
+    @apply btn bg-signal-red/15 text-signal-red border border-signal-red/30 hover:bg-signal-red/25;
+  }
+  .btn-ghost {
+    @apply btn text-paper-muted hover:text-paper hover:bg-ink-raised;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-mono font-medium;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

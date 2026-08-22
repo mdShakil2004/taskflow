@@ -1,0 +1,42 @@
+{
+  "name": "TaskFlow (cloud dev)",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:1-20-bullseye",
+
+  "features": {
+    // Gives this Codespace its own Docker daemon so `docker compose up`
+    // works inside the Codespace terminal — this is what runs the api,
+    // worker, postgres, and redis containers. Nothing is installed on the
+    // developer's actual laptop.
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    }
+  },
+
+  // 3000 = API + Swagger UI, 5173 = frontend (Vite dev server).
+  // Postgres (5432) and Redis (6379) are intentionally NOT listed here —
+  // docker-compose.yml binds them to 127.0.0.1 only, so there is nothing
+  // for Codespaces to detect or offer to forward publicly.
+  "forwardPorts": [3000, 5173],
+  "portsAttributes": {
+    "3000": { "label": "TaskFlow API / Swagger", "onAutoForward": "notify" },
+    "5173": { "label": "TaskFlow Frontend", "onAutoForward": "openPreview" }
+  },
+
+  // Runs once when the Codespace is first created: installs both the
+  // backend and frontend npm dependencies, and generates frontend/.env with
+  // the correct forwarded API URL for THIS Codespace (see the script for
+  // details — it reads Codespaces' own CODESPACE_NAME env var, nothing
+  // hardcoded or guessed).
+  "postCreateCommand": "bash scripts/setup-codespaces-env.sh && npm install && (cd frontend && npm install)",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint", "prisma.prisma", "bradlc.vscode-tailwindcss"]
+    }
+  },
+
+  "remoteEnv": {
+    "NODE_ENV": "development"
+  }
+}
