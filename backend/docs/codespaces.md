@@ -1,125 +1,560 @@
 # Running TaskFlow in GitHub Codespaces
 
-This covers running the **entire project — API, worker, Postgres, Redis, and
-the React frontend — in GitHub Codespaces (or an equivalent cloud dev
-environment)**, with nothing installed on your laptop except a browser (and
-optionally VS Code, if you prefer the desktop app connected to the Codespace
-instead of the browser-based editor).
+This guide covers running the complete TaskFlow stack in **GitHub Codespaces**:
 
-Docker is still a hard requirement of the assignment and is still fully
-present in this repo (`Dockerfile`, `docker-compose.yml`) — the only thing
-that changes is *where* `docker compose up` runs: inside the cloud
-container, not on your machine. See `.devcontainer/devcontainer.json`, which
-gives the Codespace its own nested Docker daemon
-(`docker-in-docker` devcontainer feature) specifically so that command works.
+* React frontend
+* Fastify API
+* PostgreSQL
+* Redis
+* BullMQ worker
 
-## 1. Open the repository in a Codespace
+No local Docker installation is required. Docker runs inside the Codespace.
 
-On GitHub: **Code → Codespaces → Create codespace on main**. The devcontainer
-build takes a minute or two the first time (it installs Node 20 + Docker,
-then `postCreateCommand` runs `npm install` for both the API and the
-frontend, and generates `frontend/.env` automatically — see step 3).
+---
 
-## 2. Start the backend infrastructure
+## 1. Open the Repository in GitHub Codespaces
 
-In the Codespace terminal:
+Open the repository:
 
-```bash
-docker compose up --build
+**GitHub → Code → Codespaces → Create codespace on `main`**
+
+The repository includes a development container configuration under:
+
+```text
+.devcontainer/
 ```
 
-This starts `postgres`, `redis`, `api`, and `worker` — identical to running
-it locally, just executed on GitHub's infrastructure instead of yours.
+The Codespace provides:
 
-In a second terminal, run migrations and seed data (only needed once per
-fresh database):
+* Node.js 20
+* Docker
+* Nested Docker support
+* Project dependencies
+
+After the Codespace finishes creating, open the terminal.
+
+---
+
+## 2. Start PostgreSQL and Redis
+
+From the backend directory:
 
 ```bash
-npm run db:setup
+cd backend
 ```
 
-Watch for the "TaskFlow API started" log line, and confirm:
+Start the infrastructure:
+
+```bash
+docker compose up -d postgres redis
+```
+
+Verify:
+
+```bash
+docker compose ps
+```
+
+Expected:
+
+```text
+postgres   healthy
+redis      healthy
+```
+
+You can verify PostgreSQL directly:
+
+```bash
+docker compose exec postgres pg_isready -U taskflow -d taskflow
+```
+
+Expected:
+
+```text
+accepting connections
+```
+
+Verify Redis:
+
+```bash
+docker compose exec redis redis-cli ping
+```
+
+Expected:
+
+```text
+PONG
+```
+
+---
+
+## 3. Apply Database Migrations
+
+Run Prisma migrations against the PostgreSQL container:
+
+```bash
+docker compose run --rm api npx prisma migrate deploy
+```
+
+Expected when migrations are already applied:
+
+```text
+No pending migrations to apply.
+```
+
+Check migration status:
+
+```bash
+docker compose run --rm api npx prisma migrate status
+```
+
+---
+
+## 4. Seed the Database
+
+Run:
+
+```bash
+docker compose run --rm api npm run prisma:seed
+```
+
+This creates the development/demo data required by the application.
+
+---
+
+## 5. Start the API and Worker
+
+Start both services:
+
+```bash
+docker compose up -d api worker
+```
+
+Verify:
+
+```bash
+docker compose ps
+```
+
+You should see:
+
+```text
+postgres   healthy
+redis      healthy
+api        running
+worker     running
+```
+
+Check the API logs:
+
+```bash
+docker compose logs --tail=50 api
+```
+
+Expected:
+
+```text
+TaskFlow API started
+port: 3000
+```
+
+Check the worker:
+
+```bash
+docker compose logs --tail=50 worker
+```
+
+Expected:
+
+```text
+TaskFlow worker started, listening for task-assignment notifications
+```
+
+---
+
+## 6. Verify the Backend
+
+From the Codespace terminal:
 
 ```bash
 curl http://localhost:3000/health
 ```
 
-This `curl` works from *inside* the Codespace terminal because the terminal
-shares the container's network — this is different from the browser, see
-step 4.
+Expected:
 
-## 3. Frontend API URL — why it isn't just `localhost:3000`
-
-This is the one genuinely different thing about cloud development, so it's
-worth explaining rather than hand-waving:
-
-When you open the frontend in your browser, the React/Vite JavaScript runs
-**in your own browser on your own machine** — it is not "inside" the
-Codespace. Your browser has no route to `localhost:3000`, because that
-`localhost` refers to the Codespace's cloud VM, not your laptop. Instead,
-the browser must call the API's **forwarded** URL, which GitHub generates
-per-Codespace and looks like:
-
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": "ok",
+    "redis": "ok"
+  }
+}
 ```
+
+This verifies that the API can communicate with both PostgreSQL and Redis.
+
+---
+
+# 7. Frontend API URL in Codespaces
+
+There is an important difference between local development and Codespaces.
+
+When the React application runs in your browser, this:
+
+```text
+localhost:3000
+```
+
+refers to **your own computer**, not the Codespace.
+
+The browser therefore needs to access the API through the Codespaces forwarded URL:
+
+```text
 https://<codespace-name>-3000.app.github.dev
 ```
 
-`postCreateCommand` already ran `scripts/setup-codespaces-env.sh`, which
-detects it's running in Codespaces (via the `CODESPACE_NAME` environment
-variable GitHub injects automatically) and writes the correct URL into
-`frontend/.env` for you — nothing to hand-copy. If you ever need to
-regenerate it (e.g. after significant devcontainer changes):
+The frontend environment should therefore contain:
+
+```env
+VITE_API_URL=https://<codespace-name>-3000.app.github.dev
+```
+
+The repository includes:
+
+```text
+scripts/setup-codespaces-env.sh
+```
+
+which can generate the Codespaces frontend API URL.
+
+If necessary, regenerate it with:
 
 ```bash
 npm run codespaces:env
 ```
 
-## 4. Start the frontend
+---
+
+# 8. Start the Frontend
+
+From the repository root:
 
 ```bash
 cd frontend
-npm run dev
 ```
 
-VS Code / the Codespaces browser UI will prompt to open the forwarded
-`5173` port — accept it, or open the **Ports** tab and click the globe icon
-next to `5173`.
+Install dependencies if required:
 
-## 5. Port visibility
+```bash
+npm install
+```
 
-By default, Codespaces forwards ports as **Private** — reachable only when
-you're browsing while signed into the same GitHub account that owns the
-Codespace. That's sufficient for your own testing. If you need someone else
-(e.g. a reviewer) to open the running app directly:
+Start Vite:
 
-1. Open the **Ports** tab in the Codespace.
-2. Right-click port `3000` (API) → **Port Visibility → Public**.
-3. Do the same for port `5173` (frontend).
+```bash
+npm run dev -- --host 0.0.0.0
+```
 
-Only `3000` and `5173` should ever need to be forwarded or made public.
-`5432` (Postgres) and `6379` (Redis) are bound to `127.0.0.1` in
-`docker-compose.yml` specifically so they never show up as forwardable in
-the first place — the frontend talks to the API only, never to the database
-or queue directly, matching the assignment's security model.
+The frontend listens on:
 
-## 6. Swagger / API docs
+```text
+5173
+```
 
-Once the API is running, Swagger UI is at the forwarded `3000` URL + `/docs`,
-e.g. `https://<codespace-name>-3000.app.github.dev/docs`.
+Codespaces should detect the port automatically.
 
-## Summary of ports
+Open the **Ports** panel and click the globe/open icon next to port `5173`.
 
-| Port | What | Forwarded? |
-|---|---|---|
-| 3000 | API + Swagger (`/docs`) | Yes |
-| 5173 | Frontend (Vite dev server) | Yes |
-| 5432 | Postgres | No — loopback only |
-| 6379 | Redis | No — loopback only |
+---
 
-## Going back to a plain local machine later
+# 9. Codespaces Port Configuration
 
-Nothing here is Codespaces-specific at the application level — the same
-`docker compose up --build` and `npm run dev` commands work identically on a
-laptop with Docker Desktop installed. `scripts/setup-codespaces-env.sh`
-automatically falls back to `VITE_API_URL=http://localhost:3000` when
-`CODESPACE_NAME` isn't set, so the same script works in both environments.
+The application uses:
+
+|   Port | Service               | Browser Access |
+| -----: | --------------------- | -------------- |
+| `3000` | Fastify API + Swagger | Forwarded      |
+| `5173` | React + Vite          | Forwarded      |
+| `5432` | PostgreSQL            | Not forwarded  |
+| `6379` | Redis                 | Not forwarded  |
+
+Only the frontend and API need browser access.
+
+PostgreSQL and Redis remain infrastructure services and should not be exposed to the browser.
+
+---
+
+# 10. Make Ports Public for a Reviewer
+
+By default, Codespaces ports may be **Private**.
+
+If an external reviewer needs to access the running application:
+
+1. Open the **Ports** panel.
+2. Find port `3000`.
+3. Right-click it.
+4. Select **Port Visibility → Public**.
+5. Repeat for port `5173`.
+
+The reviewer can then access:
+
+```text
+https://<codespace-name>-5173.app.github.dev
+```
+
+The frontend communicates with:
+
+```text
+https://<codespace-name>-3000.app.github.dev
+```
+
+Do **not** make PostgreSQL `5432` or Redis `6379` public.
+
+---
+
+# 11. Swagger / API Documentation
+
+Swagger UI is available at:
+
+```text
+https://<codespace-name>-3000.app.github.dev/docs
+```
+
+For example:
+
+```text
+https://fuzzy-parakeet-wrv7rxxxv9939v5w-3000.app.github.dev/docs
+```
+
+Swagger provides an interactive interface for testing the backend API.
+
+---
+
+# 12. Verify the Complete Stack
+
+Run:
+
+```bash
+docker compose ps
+```
+
+Then:
+
+```bash
+docker compose exec postgres pg_isready -U taskflow -d taskflow
+```
+
+Then:
+
+```bash
+docker compose exec redis redis-cli ping
+```
+
+Then:
+
+```bash
+curl http://localhost:3000/health
+```
+
+Then check the worker:
+
+```bash
+docker compose logs --tail=50 worker
+```
+
+Finally check Prisma:
+
+```bash
+docker compose run --rm api npx prisma migrate status
+```
+
+A healthy environment should have:
+
+```text
+PostgreSQL  → healthy
+Redis       → healthy
+API         → running
+Worker      → running
+Prisma      → no pending migrations
+Health      → database: ok, redis: ok
+Frontend    → port 5173
+```
+
+---
+
+# 13. Useful Docker Commands
+
+### View all services
+
+```bash
+docker compose ps
+```
+
+### View API logs
+
+```bash
+docker compose logs --tail=100 api
+```
+
+### Follow API logs
+
+```bash
+docker compose logs -f api
+```
+
+### View worker logs
+
+```bash
+docker compose logs --tail=100 worker
+```
+
+### Follow worker logs
+
+```bash
+docker compose logs -f worker
+```
+
+### Restart API
+
+```bash
+docker compose restart api
+```
+
+### Restart worker
+
+```bash
+docker compose restart worker
+```
+
+### Stop the stack
+
+```bash
+docker compose down
+```
+
+This does **not** remove the PostgreSQL volume.
+
+### Stop and remove database volume
+
+```bash
+docker compose down -v
+```
+
+Use this only when you intentionally want to delete the local Docker PostgreSQL data.
+
+---
+
+# 14. Local Machine Compatibility
+
+Codespaces does not change the application architecture.
+
+The same Docker Compose setup can be run on a local machine with Docker installed:
+
+```bash
+docker compose up --build
+```
+
+The Codespaces-specific frontend configuration automatically uses the forwarded API URL when `CODESPACE_NAME` is available.
+
+Outside Codespaces, the frontend falls back to:
+
+```text
+http://localhost:3000
+```
+
+Therefore the same codebase supports both:
+
+```text
+GitHub Codespaces
+       │
+       ├── Docker
+       ├── PostgreSQL
+       ├── Redis
+       ├── API
+       ├── Worker
+       └── React
+       
+and
+
+Local Docker
+       │
+       ├── PostgreSQL
+       ├── Redis
+       ├── API
+       ├── Worker
+       └── React
+```
+
+---
+
+# 15. Recommended Startup Sequence
+
+For a fresh Codespace:
+
+```bash
+cd backend
+```
+
+```bash
+docker compose up -d postgres redis
+```
+
+```bash
+docker compose run --rm api npx prisma migrate deploy
+```
+
+```bash
+docker compose run --rm api npm run prisma:seed
+```
+
+```bash
+docker compose up -d api worker
+```
+
+Verify:
+
+```bash
+docker compose ps
+```
+
+Then:
+
+```bash
+curl http://localhost:3000/health
+```
+
+Start the frontend:
+
+```bash
+cd ../frontend
+npm install
+npm run dev -- --host 0.0.0.0
+```
+
+Open the forwarded **5173** port in the browser.
+
+---
+
+# Summary
+
+```text
+                    GitHub Codespace
+                           │
+                    Docker Compose
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+     Frontend              API              Worker
+      :5173               :3000               │
+        │                  │                  │
+        │                  ├──── PostgreSQL ───┤
+        │                  │       :5432       │
+        │                  │                  │
+        │                  └──── Redis ────────┘
+        │                          :6379
+        │
+        └──────── Browser
+```
+
+Only **5173** and **3000** need to be forwarded to the browser. PostgreSQL and Redis remain internal infrastructure.
