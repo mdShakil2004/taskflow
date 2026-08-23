@@ -45,7 +45,9 @@ flowchart LR
 
 ### Authentication Flow
 
-```mermaid
+
+
+```
 sequenceDiagram
     participant C as Client
     participant A as API
@@ -63,6 +65,9 @@ sequenceDiagram
     A->>DB: Lookup org_members(user, organization) → role
     A-->>C: 403 if no membership; otherwise proceed
 ```
+
+
+
 
 The access token contains the user identity required for authentication. Organization membership and role are resolved server-side from PostgreSQL.
 
