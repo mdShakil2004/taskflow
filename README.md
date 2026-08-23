@@ -8,7 +8,11 @@ TaskFlow provides organization-scoped project and task management with secure au
 
 ## 🎥 Working Demo
 
-[![TaskFlow Demo](https://img.youtube.com/vi/unS2rHzq0lY/maxresdefault.jpg)](https://youtu.be/unS2rHzq0lY)
+## 🎥 Working Demo
+
+[![TaskFlow Demo](https://img.youtube.com/vi/unS2rHzq0lY/maxresdefault.jpg)](https://youtu.be/unS2rHzq0lY?autoplay=1)
+
+
 
 **▶ [Watch the TaskFlow working demo](https://youtu.be/unS2rHzq0lY)**
 
