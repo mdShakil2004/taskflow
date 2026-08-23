@@ -1,185 +1,587 @@
 # TaskFlow — Technical Decisions
 
-## Why Fastify over Express
-Fastify's schema-driven request lifecycle and built-in hooks (`preHandler`)
-map directly onto the layered auth → tenant → RBAC checks this assignment
-requires, without extra middleware libraries. Its official `@fastify/swagger`
-plugin also keeps the OpenAPI spec close to the route declarations, reducing
-the chance of Swagger drifting from the real API.
+This document records the key engineering decisions behind TaskFlow, including the reasoning, trade-offs, and known limitations.
 
-## Why Prisma
-Prisma's generated client gives compile-time-checked queries (important for
-"strict TypeScript, no `any`") and a first-class migration workflow
-(`prisma migrate dev` / `deploy`), satisfying the "no manually maintained
-schema.sql" requirement while still allowing hand-written SQL migrations
-(used for the generated `tsvector` column, which Prisma's schema DSL can't
-express directly).
+---
 
-## Why PostgreSQL
-Mandated by the assignment. Beyond that: native `tsvector`/GIN full-text
-search (used for the bonus task search) and native enum types (used for
-`TaskStatus`/`TaskPriority`) are both first-class Postgres features that a
-generic ORM-only approach would otherwise have to fake with string columns.
+## 1. Why Fastify over Express
 
-## Why Redis + BullMQ
-Mandated by the assignment. BullMQ specifically (over a hand-rolled Redis
-queue) gives production-grade retry/backoff, a queryable job state machine
-(`waiting`/`active`/`completed`/`failed`) that maps directly onto
-`GET /jobs/:id`, and a Redis-coordinated rate limiter, which is what makes the
-bonus global 50 emails/minute limit correct across multiple worker instances
-rather than just per-process.
+Fastify's schema-driven request lifecycle and built-in `preHandler` hooks map naturally to the layered authentication, tenant, and RBAC checks required by the assignment.
 
-## CORS and cloud dev environments
-`app.ts` registers CORS with `origin: true` (reflect the request's own
-Origin header rather than a fixed allowlist). This is a deliberate choice,
-not an oversight: when the app runs in GitHub Codespaces, the frontend is
-served from a per-Codespace, per-session URL
-(`https://<codespace-name>-5173.app.github.dev`) that isn't known ahead of
-time and changes every time a new Codespace is created — a static
-allowlisted origin would break that workflow. `X-Organization-Id` and
-`Authorization` are the only non-default headers the frontend sends, and
-both are explicitly reflected in preflight responses (verified in practice —
-see `docs/codespaces.md`). The actual security boundary is unaffected either
-way: CORS only controls which *browser* origins may read the response, while
-every request is still authenticated by JWT and tenant-scoped by
-`org_members` regardless of Origin — a permissive CORS policy widens who can
-*attempt* a request from a browser, not who can succeed.
+The official `@fastify/swagger` plugin also keeps the OpenAPI definition close to the route declarations, reducing the risk of documentation drifting from the actual API.
 
-## Why offset pagination over cursor pagination
-The assignment allows either. Offset was chosen because:
-1. Task/project lists in TaskFlow are typically small-to-medium (hundreds, not millions, of rows per project), so the "skip N rows" cost is negligible.
-2. The assignment's own example response body is the offset shape (`data/total/page/limit`), and Swagger/Postman consumers can jump to an arbitrary page (e.g. "show me page 5") which cursor pagination can't do.
-3. It keeps the API surface simpler for a reviewer to exercise manually.
-The tradeoff: offset pagination degrades on very large, frequently-mutated
-tables (page drift, `COUNT(*)` cost). If TaskFlow's task volume grew into the
-millions-per-project range, cursor pagination (keyset on `created_at, id`)
-would be the next step — noted here rather than silently ignored.
+---
 
-## Password hashing
-bcrypt with `BCRYPT_ROUNDS=12` (enforced as a config floor via
-`z.coerce.number().int().min(12)` in `src/config.ts` — the app refuses to
-start with a lower value). Chosen over Argon2 because bcrypt is what the
-assignment explicitly names, and its cost factor is trivially auditable in
-code review (`bcrypt.hash(password, config.BCRYPT_ROUNDS)`).
+## 2. Why Prisma
 
-## JWT design
-Two secrets (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`) so that a leak of one
-does not compromise the other. Payload is intentionally minimal —
-`{ sub, type }` for access tokens, `{ sub, type, jti }` for refresh tokens —
-with no role or organization embedded. This is a direct consequence of the
-multi-tenancy requirement: a user's role can differ per organization and a
-user can belong to more than one, so baking a single role/org into the token
-would either be wrong the moment the user switches context or require
-re-issuing tokens on every org switch. Instead, role/org are re-resolved from
-`org_members` on every request (see tenant.middleware.ts).
+Prisma provides a generated, type-safe client that supports the project's strict TypeScript requirement without relying on `any`.
 
-## Refresh token strategy
-Refresh tokens are stored in `refresh_tokens` as a **SHA-256 hash**, never
-plaintext — a stolen database export alone cannot be replayed as a valid
-session. Rotation is implemented: every `/auth/refresh` call issues a new
-token pair and revokes the presented one, linking old → new via
-`replaced_by_id`. If a *revoked* token is presented again (a strong signal of
-theft — the legitimate client should already have the newer token), the
-service revokes **every** active refresh token for that user as a defensive
-measure, not just the one presented.
+It also provides a first-class migration workflow through:
 
-## RBAC
-Two roles (`org_admin`, `member`), matching the assignment exactly — no
-speculative extra roles. Enforcement is centralized in
-`middleware/role.middleware.ts::requireRole(...roles)`, applied as a
-`preHandler` on specific routes (currently: member management, project
-deletion) rather than duplicated as `if` checks inside each controller.
+```bash
+prisma migrate dev
+prisma migrate deploy
+```
 
-## Multi-tenant isolation
-Three layers, deliberately redundant:
-1. **Middleware**: `tenant.middleware.ts` refuses to attach `request.auth` unless a real `org_members` row exists for (header org id, JWT user id).
-2. **Repository queries**: every org-owned resource query includes `organizationId` (or, for tasks, the `project.organizationId` relation) as a `WHERE` condition — not as a post-fetch filter. A cross-tenant lookup returns "not found", not "found, then rejected", which is why cross-tenant reads return 404 (record genuinely not visible in that scope) while cross-tenant *impersonation attempts* (selecting another org via the header without membership) return 403 at the middleware layer, before any resource is even queried. Both codepaths are exercised in `tests/integration/task-crud-and-tenancy.integration.test.ts`.
-3. **Task authorization is never by task id alone**: every task-scoped query joins back through `project.organizationId`, per the assignment's explicit instruction.
+This satisfies the requirement to use Prisma migrations rather than maintaining a manually written `schema.sql`.
 
-## FK CASCADE/RESTRICT choices
-See `docs/database.md` for the full table; summarized rule: deleting a
-container (`organization` → `projects`, `project` → `tasks`, `task` →
-`assignments`/`comments`) cascades, because the child is meaningless without
-its parent. Deleting a `user` is `RESTRICT`ed from `task_assignments` and
-`comments` — a user is not "owned" by an organization the way a task is owned
-by a project, and silently cascading a user's deletion into destroying
-assignment/comment history would erase an audit trail. The intended path for
-removing a user's access is removing their `org_members` row (which *does*
-cascade) or, in a future iteration, an `is_active` deactivation flag.
+A small amount of hand-written SQL is still used where Prisma's schema DSL cannot directly express the PostgreSQL `tsvector` search column.
 
-## Indexing strategy
-Indexes are added for query patterns that actually run in this codebase (see
-inline comments in `prisma/schema.prisma` and the initial migration), not
-speculatively on every column:
-- `org_members(organization_id, user_id)` — unique, backs the per-request membership check.
-- `projects(organization_id)` — backs the project list endpoint.
-- `tasks(project_id)`, `tasks(project_id, status)`, `tasks(project_id, priority)`, `tasks(due_date)` — back the task list + filter endpoints and the dashboard aggregate.
-- `task_assignments(task_id, user_id)` unique — enforces the "one assignment per user per task" rule at the DB level, not just in application code.
-- `tasks.search_vector` GIN index — backs full-text search without a sequential scan.
+---
 
-## Queue retry / backoff semantics
-"Retry failed jobs 3 times" with a 3-step backoff (1s → 2s → 4s) is read as
-**3 retries after the initial attempt = 4 total attempts**, because the
-backoff sequence has exactly 3 delays (one per retry). Implemented as BullMQ
-`attempts: 4, backoff: { type: 'exponential', delay: 1000 }`. This is called
-out explicitly here (rather than left ambiguous) because "N retries" is
-genuinely read both ways in practice.
+## 3. Why PostgreSQL
 
-## Dead-letter queue strategy
-BullMQ has no built-in DLQ primitive — a "failed" job simply stays in the
-original queue's failed set. TaskFlow implements the DLQ as a second, plain
-BullMQ queue (`task-assignment-notifications-dlq`) that the worker's
-`failed` event handler pushes to once `job.attemptsMade >= attempts`. This
-keeps failed notifications inspectable/replayable rather than either (a)
-silently vanishing or (b) cluttering the primary queue's failed-job list
-indefinitely.
+PostgreSQL is required by the assignment.
 
-## Assignment / queue consistency strategy
-This is the trickiest requirement in the assignment: the API must persist the
-assignment *and* enqueue the job before returning success, but must not leave
-inconsistent state if either half fails.
+It also provides two capabilities used directly by TaskFlow:
 
-**What is NOT true**: PostgreSQL and Redis do not share a distributed
-transaction. There is no way to atomically guarantee "assignment row exists
-in Postgres" AND "job exists in Redis" as a single all-or-nothing operation.
+* Native PostgreSQL enums for `TaskStatus` and `TaskPriority`
+* Native `tsvector` and GIN indexes for the bonus full-text task search
 
-**What TaskFlow actually does**:
-1. Write the `TaskAssignment` row and a `NotificationOutbox` row (status
-   `pending`) in **one Postgres transaction**. This part *is* atomic — the
-   assignment and its outbox record are always consistent with each other.
-2. Immediately after committing, attempt to enqueue the BullMQ job in the
-   same request. If it succeeds, mark the outbox row `dispatched` and return
-   `jobId` to the client — this is the common case and satisfies "enqueue the
-   job before returning a successful response".
-3. If the enqueue attempt throws (e.g. Redis briefly unreachable), the
-   request **still returns 201** with `jobId: null` — the assignment itself
-   is real and already committed; there is no reason to fail the whole
-   request over a notification. The outbox row stays `pending`.
-4. A background sweep in the worker (every 10s, only rows older than a 5s
-   grace period) finds `pending` outbox rows and enqueues them, then marks
-   them `dispatched`.
+These features avoid implementing database-level equivalents through generic string columns or application-side search.
 
-**Net guarantee**: the assignment write can never be "lost" due to a queue
-failure, and the notification is *eventually* delivered even if the
-immediate enqueue attempt fails — at the cost of a bounded delay (up to ~15s
-worst case: 5s grace + up to 10s until the next sweep) in that failure case
-only. This is documented as a deliberate at-least-once, eventually-consistent
-design rather than a false claim of strict consistency.
+---
 
-**Failure mode not fully covered**: if the worker process itself is down for
-longer than expected, `pending` outbox rows accumulate until it comes back —
-there's no separate alerting on outbox backlog age in this submission; that
-would be a natural next step (e.g. exposing a `/health` check that also
-reports oldest-pending-outbox-age).
+## 4. Why Redis + BullMQ
 
-## Test isolation strategy
-Integration tests truncate every application table in `beforeEach` (see
-`tests/integration/test-helpers.ts::truncateAll`) rather than relying on
-transaction rollback. Fastify's `app.inject()` and Prisma's own connection
-pooling don't compose cleanly with wrapping each test in an outer
-transaction (Prisma's `$transaction` in the app code would itself be nested
-inside a test transaction, which Postgres doesn't support the way some
-ORMs' savepoint-based test helpers assume). Truncation is simpler, fully
-reliable, and fast enough at this data volume. Tests are expected to run
-against a **dedicated test database** (see README "Running tests") — never
-against a developer's normal dev database.
+Redis and BullMQ are required by the assignment.
+
+BullMQ was chosen instead of implementing a custom Redis queue because it provides:
+
+* Retry and backoff handling
+* Queryable job states
+* `waiting`, `active`, `completed`, and `failed` states
+* Job status information used by `GET /jobs/:id`
+* Redis-coordinated rate limiting
+
+The Redis-backed limiter also allows the global email limit to remain coordinated when multiple worker instances are running, rather than applying a separate limit inside each process.
+
+---
+
+## 5. CORS and GitHub Codespaces
+
+TaskFlow uses:
+
+```ts
+origin: true
+```
+
+for CORS.
+
+This reflects the request's Origin rather than relying on a fixed allowlist.
+
+This is intentional because GitHub Codespaces generates a different frontend URL for each Codespace, for example:
+
+```text
+https://<codespace-name>-5173.app.github.dev
+```
+
+A static allowlist would therefore require manual configuration whenever a new Codespace is created.
+
+The frontend sends:
+
+```text
+Authorization
+X-Organization-Id
+```
+
+and these headers are handled by the CORS preflight configuration.
+
+CORS is not the application's authorization boundary.
+
+Every request is still protected by:
+
+```text
+JWT authentication
+        ↓
+Organization membership verification
+        ↓
+Tenant-scoped database queries
+```
+
+Therefore, permissive CORS determines which browser origins can attempt to read responses; it does not grant authorization to access another tenant's data.
+
+---
+
+## 6. Why Offset Pagination
+
+The assignment allows either offset or cursor pagination.
+
+TaskFlow uses offset pagination because:
+
+1. The expected project/task datasets are small-to-medium rather than millions of rows per project.
+2. The assignment's example response uses:
+
+```json
+{
+  "data": [],
+  "total": 0,
+  "page": 1,
+  "limit": 20
+}
+```
+
+3. Reviewers can directly request arbitrary pages.
+4. The API remains straightforward to exercise through Swagger and Postman.
+
+The trade-off is that offset pagination becomes less efficient on very large, frequently changing datasets because of `OFFSET` cost, `COUNT(*)`, and page drift.
+
+If task volumes eventually reach millions of records per project, cursor/keyset pagination based on `(created_at, id)` would be the natural next step.
+
+---
+
+## 7. Password Hashing
+
+TaskFlow uses bcrypt with:
+
+```text
+BCRYPT_ROUNDS=12
+```
+
+The configuration enforces a minimum cost of 12:
+
+```ts
+z.coerce.number().int().min(12)
+```
+
+The application refuses to start if a lower value is configured.
+
+bcrypt was selected because the assignment explicitly requires it and because the configured cost factor is directly auditable in the implementation.
+
+---
+
+## 8. JWT Design
+
+TaskFlow uses separate secrets for access and refresh tokens:
+
+```text
+JWT_ACCESS_SECRET
+JWT_REFRESH_SECRET
+```
+
+This prevents compromise of one signing secret from automatically compromising the other token type.
+
+The token payload is intentionally minimal.
+
+### Access token
+
+```json
+{
+  "sub": "userId",
+  "type": "access"
+}
+```
+
+### Refresh token
+
+```json
+{
+  "sub": "userId",
+  "type": "refresh",
+  "jti": "tokenId"
+}
+```
+
+Role and organization are intentionally **not** embedded in the JWT.
+
+A user can belong to multiple organizations and can have different roles in each organization. Embedding one organization/role into the token would therefore create stale or incorrect authorization context when the user changes organizations.
+
+Instead, the organization and role are resolved from `org_members` for each authenticated request.
+
+---
+
+## 9. Refresh Token Strategy
+
+Only a SHA-256 hash of the refresh token is stored:
+
+```text
+refresh_tokens.token_hash
+```
+
+The raw refresh token is never persisted.
+
+This provides an additional layer of protection if the database is exposed.
+
+Refresh-token rotation is also implemented.
+
+Each refresh operation:
+
+1. Validates the presented refresh token.
+2. Issues a new access/refresh token pair.
+3. Revokes the presented refresh token.
+4. Links the old token to the replacement using `replaced_by_id`.
+
+If a previously revoked refresh token is presented again, this is treated as a potential token-theft signal. All active refresh tokens for that user are revoked as a defensive response.
+
+---
+
+## 10. RBAC
+
+TaskFlow implements exactly the two roles defined by the assignment:
+
+```text
+org_admin
+member
+```
+
+No additional roles are introduced.
+
+Authorization is centralized through:
+
+```text
+middleware/role.middleware.ts
+```
+
+using:
+
+```text
+requireRole(...roles)
+```
+
+The authorization check is attached to protected routes through Fastify `preHandler` hooks instead of duplicating role checks inside individual controllers.
+
+Currently, this is used for operations such as:
+
+* Member management
+* Project deletion
+
+---
+
+## 11. Multi-Tenant Isolation
+
+Tenant isolation is deliberately enforced at multiple layers.
+
+### Layer 1 — Tenant Middleware
+
+`tenant.middleware.ts` verifies that the authenticated user actually has a membership record for the requested organization.
+
+No valid membership means no authenticated organization context is attached to the request.
+
+### Layer 2 — Repository Queries
+
+Organization-owned queries include the authenticated `organizationId` directly in the database `WHERE` condition.
+
+The application does not:
+
+```text
+fetch resource
+      ↓
+filter tenant in memory
+```
+
+Instead, tenant scope is part of the database query itself.
+
+For tasks, the query also scopes through:
+
+```text
+project.organizationId
+```
+
+This prevents a task ID from becoming a cross-tenant access path.
+
+### 403 vs 404
+
+There are two distinct cases:
+
+```text
+User selects an organization they do not belong to
+                    ↓
+                  403
+```
+
+versus:
+
+```text
+User is authenticated for their organization
+                    ↓
+Resource belongs to another organization
+                    ↓
+Scoped query cannot see it
+                    ↓
+404
+```
+
+This prevents cross-tenant resource existence from being unnecessarily exposed.
+
+---
+
+## 12. Foreign Key CASCADE / RESTRICT Strategy
+
+Container-owned resources use cascading deletion where the child has no independent meaning.
+
+For example:
+
+```text
+Organization
+    ├── Projects
+    │      └── Tasks
+    │             ├── Assignments
+    │             └── Comments
+    └── Members
+```
+
+Deleting the parent therefore cascades to its dependent records.
+
+User deletion is more restrictive for historical records.
+
+`task_assignments` and `comments` use `RESTRICT` because automatically deleting those records would destroy assignment and authorship history.
+
+The intended approach for removing a user's access is to remove the relevant organization membership or deactivate the user rather than destroying historical records.
+
+---
+
+## 13. Indexing Strategy
+
+Indexes are based on query patterns actually used by the application rather than being added indiscriminately.
+
+### Organization membership
+
+```text
+org_members(organization_id, user_id)
+```
+
+Used for per-request membership verification.
+
+### Projects
+
+```text
+projects(organization_id)
+```
+
+Used by organization-scoped project listing.
+
+### Tasks
+
+```text
+tasks(project_id)
+tasks(project_id, status)
+tasks(project_id, priority)
+tasks(due_date)
+```
+
+These support task listing, filtering, and dashboard queries.
+
+### Task assignments
+
+```text
+task_assignments(task_id, user_id)
+```
+
+is unique and enforces the one-assignment-per-user-per-task invariant at the database level.
+
+### Full-text search
+
+```text
+tasks.search_vector
+```
+
+has a GIN index for PostgreSQL full-text search.
+
+---
+
+## 14. Queue Retry and Backoff Semantics
+
+The assignment specifies three retries with a three-step backoff:
+
+```text
+1s → 2s → 4s
+```
+
+TaskFlow interprets this as:
+
+```text
+Initial attempt
+    ↓
+Retry 1 — 1s
+    ↓
+Retry 2 — 2s
+    ↓
+Retry 3 — 4s
+```
+
+Therefore:
+
+```text
+4 total attempts
+```
+
+BullMQ configuration:
+
+```ts
+{
+  attempts: 4,
+  backoff: {
+    type: "exponential",
+    delay: 1000
+  }
+}
+```
+
+This interpretation is explicitly documented because "3 retries" can otherwise be interpreted as either three total attempts or three attempts after the initial attempt.
+
+---
+
+## 15. Dead-Letter Queue
+
+BullMQ does not provide a separate first-class DLQ abstraction.
+
+TaskFlow therefore uses a second BullMQ queue:
+
+```text
+task-assignment-notifications-dlq
+```
+
+When a notification job exhausts its configured attempts, the worker's `failed` event handler publishes the failed job to the DLQ.
+
+This keeps failed notifications separately inspectable and replayable rather than allowing them to remain indefinitely mixed with the primary queue's failed jobs.
+
+---
+
+## 16. Assignment / Queue Consistency
+
+This is the most important consistency decision in the notification workflow.
+
+The system must persist the task assignment and enqueue its notification before returning success on the normal path.
+
+However, PostgreSQL and Redis do not participate in the same distributed transaction.
+
+Therefore, the application cannot atomically guarantee that both the PostgreSQL row and Redis job either succeed or fail together.
+
+### Step 1 — Atomic Database Transaction
+
+The API creates:
+
+```text
+TaskAssignment
+NotificationOutbox(pending)
+```
+
+inside one PostgreSQL transaction.
+
+Therefore, the assignment and its recovery record are committed atomically.
+
+### Step 2 — Immediate Queue Enqueue
+
+After the database transaction commits, the API immediately attempts to enqueue the BullMQ notification job.
+
+If successful:
+
+```text
+outbox → dispatched
+```
+
+and the API returns the `jobId`.
+
+### Step 3 — Redis Failure
+
+If Redis/BullMQ is temporarily unavailable:
+
+```text
+Assignment → committed
+Outbox → pending
+Job → not yet created
+```
+
+The API still returns a successful assignment response with:
+
+```json
+{
+  "jobId": null
+}
+```
+
+The assignment itself is not rolled back because notification delivery is recoverable.
+
+### Step 4 — Outbox Recovery
+
+The worker periodically checks for pending outbox records.
+
+The current recovery strategy:
+
+```text
+5s grace period
++
+worker sweep every 10s
+```
+
+Pending records are published to BullMQ and then marked as dispatched.
+
+### Result
+
+The design provides:
+
+```text
+Assignment durability
++
+At-least-once notification delivery
++
+Eventual consistency
+```
+
+If the immediate enqueue fails, the expected recovery delay is bounded to approximately 15 seconds under the documented timing assumptions.
+
+### Known Limitation
+
+If the worker itself remains down, pending outbox records accumulate until the worker returns.
+
+The current implementation does not provide dedicated alerting for an aging outbox backlog.
+
+A production extension could expose the oldest pending outbox age through health or observability metrics.
+
+---
+
+## 17. Test Isolation
+
+Integration tests use a dedicated test database.
+
+Before each test, application tables are truncated instead of wrapping every test in an outer database transaction.
+
+This was chosen because Fastify's `app.inject()`, Prisma connection pooling, and application-level Prisma transactions do not compose cleanly with an outer test transaction.
+
+Table truncation is simpler and reliable for the dataset size used by the test suite.
+
+Tests must never run against the normal development database.
+
+---
+
+## Engineering Summary
+
+The main architectural principles are:
+
+```text
+Fastify
+   ↓
+Middleware / Hooks
+   ↓
+Authentication
+   ↓
+Tenant Verification
+   ↓
+RBAC
+   ↓
+Controllers
+   ↓
+Services
+   ↓
+Repositories
+   ↓
+PostgreSQL
+```
+
+For asynchronous work:
+
+```text
+API
+ ↓
+PostgreSQL Transaction
+ ├── Assignment
+ └── Outbox
+ ↓
+BullMQ / Redis
+ ↓
+Worker
+ ↓
+Mock Email
+```
+
+The design intentionally favors **explicit authorization boundaries, database-enforced invariants, recoverable asynchronous processing, and documented trade-offs** over claiming guarantees that the underlying infrastructure cannot actually provide.
