@@ -18,7 +18,7 @@ Detailed engineering documentation is available in the repository:
 | [Implementation Plan](backend/docs/implementation-plan.md) | Assignment requirements, implementation phases, and engineering decisions |
 | [Requirement Checklist](backend/docs/requirement-checklist.md) | Requirement-by-requirement implementation checklist |
 | [Technical Decisions](backend/docs/technical-decisions.md) | Key architectural decisions, trade-offs, consistency strategy, security, and design rationale |
-| [frontend Decisions](backend/docs/technical-decisions.md) | entire frontend |
+| [frontend Decisions](frontend/README.md) | entire frontend |
 
 
 ## 🎥 Working Demo
