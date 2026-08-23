@@ -1,375 +1,1236 @@
 # TaskFlow
 
-A lightweight, multi-tenant project-management backend: users belong to
-organizations, organizations own projects, projects contain tasks, tasks can
-be assigned to users (which triggers an asynchronous email notification via
-Redis + BullMQ), and users can comment on tasks.
+> A production-oriented, multi-tenant project management backend built for the **GrubPac Technologies Backend Developer Assignment**.
 
-Built for the GrubPac Technologies backend developer assignment.
+TaskFlow provides organization-scoped project and task management with secure authentication, RBAC, PostgreSQL persistence, Redis/BullMQ asynchronous processing, and a separate background worker.
 
-> **No Docker on your laptop?** You don't need it. This project is fully
-> runnable in **GitHub Codespaces** — Docker still runs (it's a hard
-> requirement of the assignment and this repo includes a real `Dockerfile`
-> and `docker-compose.yml`), just inside the cloud container instead of your
-> machine. See [`docs/codespaces.md`](docs/codespaces.md) or jump to
-> [section 14](#14-local-setup).
+---
 
-## 1. Project overview
+## 🎥 Working Demo
 
-- Node.js 20 + TypeScript (strict mode) + Fastify
-- PostgreSQL via Prisma, with hand-reviewed raw-SQL migrations
-- Redis + BullMQ for the assignment-notification background job
-- JWT auth (access + refresh) with organization-scoped RBAC
-- Two deployable processes from one codebase: the **API** and the **worker**
-- A **React + Vite + Tailwind test console** in [`frontend/`](frontend/README.md) that exercises every endpoint — see below
+[![TaskFlow Demo](https://img.youtube.com/vi/unS2rHzq0lY/maxresdefault.jpg)](https://youtu.be/unS2rHzq0lY)
 
-## 2. Features
+**▶ [Watch the TaskFlow working demo](https://youtu.be/unS2rHzq0lY)**
 
-- Register / login / refresh (with rotation) / logout (single device or all devices)
-- Organization membership with two roles: `org_admin`, `member`
-- Full CRUD for projects and tasks, scoped to the caller's organization
-- Task filters (status, priority, assignee, due-date range) + full-text search
-- Offset pagination on every list endpoint
-- Assign / unassign a task to/from a user in the same organization
-- Async email notification on assignment, with retry/backoff/dead-letter queue
-- `GET /jobs/:id` job status endpoint
-- Project dashboard: task counts grouped by status
-- Task comments
-- Soft delete on projects/tasks
-- Bulk task status update
-- Swagger UI + Postman collection
+The demo shows the working application, authentication, organization/project/task workflows, API functionality, and background worker processing.
 
-## 3. Architecture
+---
 
-See [`docs/architecture.md`](docs/architecture.md) for diagrams. In short:
+## Architecture
 
+```mermaid
+flowchart TB
+
+    Client["React + Vite + Tailwind<br/>Test Console"]
+
+    API["Fastify API<br/>Node.js + TypeScript"]
+
+    Auth["JWT Authentication<br/>RBAC + Tenant Isolation"]
+
+    DB[("PostgreSQL 16<br/>Prisma")]
+
+    Redis[("Redis 7")]
+
+    Queue["BullMQ<br/>Task Assignment Queue"]
+
+    Worker["Background Worker<br/>Separate Process"]
+
+    Email["Mock Email<br/>Notification"]
+
+    Client -->|HTTP / REST| API
+
+    API --> Auth
+    Auth --> DB
+
+    API --> DB
+    API --> Redis
+
+    Redis --> Queue
+    Queue --> Worker
+    Worker --> Email
+
+    DB -->|Transactional Outbox| Queue
 ```
-Client -> Fastify API -> PostgreSQL (Prisma)
-                       -> Redis/BullMQ -> Worker (separate process) -> mock email
+
+### Request Flow
+
+```text
+Browser
+   │
+   │ HTTP / REST
+   ▼
+Fastify API
+   │
+   ├──────────────► PostgreSQL
+   │                    │
+   │                    └── Prisma
+   │
+   └──────────────► Redis
+                         │
+                         ▼
+                    BullMQ Queue
+                         │
+                         ▼
+                    Worker Process
+                         │
+                         ▼
+                   Mock Email
 ```
 
-Every route follows `Route -> Controller -> Service -> Repository -> Prisma`.
-Controllers are thin (parse, call service, map response); services own
-business rules; repositories are the only files that call Prisma directly.
+### Task Assignment Notification Flow
 
-## 4. Tech stack
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Fastify API
+    participant DB as PostgreSQL
+    participant Redis
+    participant Worker
+    participant Email as Mock Email
 
-Fastify, TypeScript (strict), Prisma, PostgreSQL 16, Redis 7, BullMQ, Zod,
-bcrypt, jsonwebtoken, Vitest, Docker Compose. See
-[`docs/technical-decisions.md`](docs/technical-decisions.md) for *why* each
-was chosen specifically for TaskFlow, not a generic pitch.
+    Client->>API: Assign task to user
 
-## 5. Project structure
+    API->>DB: Transaction: assignment + outbox
+    DB-->>API: Commit
 
+    API->>Redis: Enqueue notification job
+    Redis-->>API: Job ID
+
+    API-->>Client: Assignment successful
+
+    Redis->>Worker: Deliver job
+    Worker->>Email: Send notification
+
+    Email-->>Worker: Success
+    Worker-->>Redis: Mark job completed
 ```
+
+---
+
+## Why This Architecture?
+
+### Separate API and Worker Processes
+
+The API handles synchronous HTTP requests while the worker handles asynchronous notification processing.
+
+Background notification processing therefore does not block the API request lifecycle.
+
+### PostgreSQL as the Source of Truth
+
+PostgreSQL stores:
+
+* Users
+* Organizations
+* Organization memberships
+* Projects
+* Tasks
+* Assignments
+* Comments
+* Refresh tokens
+* Notification outbox records
+
+Prisma provides the database access layer.
+
+### Redis + BullMQ
+
+Task assignment notifications are processed asynchronously using Redis and BullMQ.
+
+The queue is consumed by a dedicated worker process rather than running background processing inside the API process.
+
+### Transactional Outbox
+
+Task assignment and creation of the notification outbox record happen atomically inside PostgreSQL.
+
+The system then attempts to enqueue the notification through BullMQ. If immediate queue submission fails, the worker-side recovery process can recover pending notifications.
+
+### Server-Side Multi-Tenant Isolation
+
+The organization ID supplied by the client is treated as a selector, not an authorization decision.
+
+The authenticated user's organization membership and role are re-verified against PostgreSQL before accessing organization-owned resources.
+
+---
+
+# Tech Stack
+
+| Layer             | Technology                  |
+| ----------------- | --------------------------- |
+| Runtime           | Node.js 20                  |
+| Language          | TypeScript                  |
+| API Framework     | Fastify                     |
+| Database          | PostgreSQL 16               |
+| ORM               | Prisma                      |
+| Queue             | BullMQ                      |
+| Queue Backend     | Redis 7                     |
+| Authentication    | JWT                         |
+| Password Hashing  | bcrypt                      |
+| Validation        | Zod                         |
+| API Documentation | Swagger / OpenAPI           |
+| Testing           | Vitest                      |
+| Containerization  | Docker + Docker Compose     |
+| Frontend Console  | React + Vite + Tailwind CSS |
+
+---
+
+# Key Features
+
+* User registration and login
+* Access and refresh JWT authentication
+* Refresh-token rotation and reuse detection
+* Logout for single device or all sessions
+* Multi-tenant organization model
+* Organization-scoped RBAC
+* `org_admin` and `member` roles
+* Project CRUD
+* Task CRUD
+* Task assignment and unassignment
+* Task filtering
+* Full-text task search
+* Offset pagination
+* Task comments
+* Bulk task status updates
+* Project dashboard
+* Soft deletion
+* Redis + BullMQ asynchronous notifications
+* Notification retry and exponential backoff
+* Dead-letter queue
+* Job status endpoint
+* Transactional notification outbox
+* Swagger UI
+* Postman collection
+* Unit tests
+* Integration tests
+* Dockerized API and worker
+* PostgreSQL and Redis health checks
+
+---
+
+# Project Structure
+
+```text
 taskflow/
-├── src/            # API: modules (auth, projects, tasks, ...), middleware, infra, shared
-├── worker/          # Background worker process + BullMQ job processor
-├── prisma/          # schema.prisma, hand-written migrations, seed.ts
-├── tests/           # unit/ and integration/
-├── docs/            # architecture, technical-decisions, database, requirement-checklist
-├── postman/         # Postman collection
-├── docker-compose.yml
-└── Dockerfile        # multi-stage: `api` and `worker` build targets
+│
+├── backend/
+│   ├── src/
+│   │   ├── modules/
+│   │   │   ├── auth/
+│   │   │   ├── organizations/
+│   │   │   ├── members/
+│   │   │   ├── projects/
+│   │   │   ├── tasks/
+│   │   │   └── jobs/
+│   │   │
+│   │   ├── middleware/
+│   │   ├── infrastructure/
+│   │   ├── shared/
+│   │   ├── docs/
+│   │   ├── config.ts
+│   │   └── server.ts
+│   │
+│   ├── worker/
+│   │   └── worker.ts
+│   │
+│   ├── prisma/
+│   │   ├── schema.prisma
+│   │   ├── migrations/
+│   │   └── seed.ts
+│   │
+│   ├── tests/
+│   │   ├── unit/
+│   │   └── integration/
+│   │
+│   ├── docs/
+│   │   ├── architecture.md
+│   │   ├── database.md
+│   │   ├── technical-decisions.md
+│   │   └── requirement-checklist.md
+│   │
+│   ├── postman/
+│   │   └── TaskFlow.postman_collection.json
+│   │
+│   ├── Dockerfile
+│   └── docker-compose.yml
+│
+└── frontend/
+    ├── src/
+    └── README.md
 ```
 
-## 6. Database design
+---
 
-Full detail in [`docs/database.md`](docs/database.md) (ER diagram, table
-responsibilities, CASCADE/RESTRICT rationale, indexing, soft-delete
-semantics). Seven required tables plus `refresh_tokens` (session storage) and
-`notification_outbox` (reliable async delivery — see technical-decisions.md).
+# Backend Layering
 
-## 7. Authentication
+Every API request follows:
 
-`POST /auth/register|login|refresh|logout`. bcrypt (cost 12), 15-minute
-access JWTs, 7-day refresh tokens stored as a SHA-256 hash with rotation and
-reuse detection. Full rationale in `docs/technical-decisions.md`.
+```text
+Route
+  ↓
+Controller
+  ↓
+Service
+  ↓
+Repository
+  ↓
+Prisma
+  ↓
+PostgreSQL
+```
 
-## 8. Multi-tenancy model
+Responsibilities are intentionally separated:
 
-The JWT carries only `{ sub, type }` — no role or org. Every request must
-also send `X-Organization-Id`, which is treated as a *selector*, never as an
-authorization decision: `middleware/tenant.middleware.ts` re-verifies, via a
-DB lookup against `org_members`, that the JWT-verified user is actually a
-member of that organization, and derives the role from the database. Every
-org-owned resource query is scoped by `request.auth.organizationId`
-server-side. See `docs/technical-decisions.md` → "Multi-tenant isolation".
+* **Routes** — HTTP route definitions
+* **Controllers** — request parsing and response mapping
+* **Services** — business rules
+* **Repositories** — database access
+* **Prisma** — database abstraction
+* **Middleware** — authentication, tenancy, RBAC, validation and cross-cutting concerns
 
-## 9. RBAC
+Repositories are the only application layer that directly accesses Prisma.
 
-Two roles: `org_admin`, `member`. Admins can manage members and delete
-projects. Enforced centrally via `middleware/role.middleware.ts::requireRole(...)`,
-applied as a route-level `preHandler` — never duplicated as ad hoc `if` checks.
+---
 
-## 10. Background job architecture
+# Database Design
 
-BullMQ queue `task-assignment-notifications`, consumed by a **separate**
-worker process (`worker/worker.ts`) — never run inside the API process. See
-`docs/architecture.md` for the full sequence diagram.
+The database contains the required project-management entities along with session and notification infrastructure.
 
-## 11. Queue consistency strategy
+Core entities include:
 
-The trickiest requirement: persist the assignment and enqueue the job before
-returning, without leaving inconsistent state on partial failure. TaskFlow
-writes the assignment + a transactional outbox row atomically in Postgres,
-attempts an immediate BullMQ enqueue, and falls back to a worker-side
-recovery sweep if that immediate attempt fails — all explained in detail,
-including what is and isn't actually guaranteed, in
-[`docs/technical-decisions.md`](docs/technical-decisions.md) → "Assignment /
-queue consistency strategy".
+* Users
+* Organizations
+* Organization memberships
+* Projects
+* Tasks
+* Task assignments
+* Task comments
+* Refresh tokens
+* Notification outbox
 
-## 12. Retry/DLQ strategy
+Database design details, relationships, indexes, deletion behavior, and constraints are documented in:
 
-4 total attempts (1 initial + 3 retries), exponential backoff 1s → 2s → 4s.
-After exhaustion, the job is pushed to a separate dead-letter queue
-(`task-assignment-notifications-dlq`) and `GET /jobs/:id` reports `failed`.
+```text
+docs/database.md
+```
 
-## 13. API documentation
+Migrations are maintained as SQL under:
 
-Swagger UI: `http://localhost:3000/docs` (once the API is running).
-Postman collection: [`postman/TaskFlow.postman_collection.json`](postman/TaskFlow.postman_collection.json)
-— imports with no manual edits; uses collection variables (`baseUrl`,
-`accessToken`, etc.) auto-populated by test scripts as you run the demo flow
-in order (Register → Create project → Create task → Assign → Job status →
-View task → Dashboard).
+```text
+prisma/migrations/
+```
 
-## 14. Local setup
+---
 
-TaskFlow can be run two ways — pick whichever matches your situation. Both
-use the exact same `docker compose up --build`; the only difference is
-*where* that command runs.
+# Authentication
 
-### Option 1 — Cloud development (GitHub Codespaces) — no local installs needed
+Authentication endpoints:
 
-**You do not need Docker, PostgreSQL, or Redis installed on your laptop for
-this path.** Docker still runs — just inside the cloud container, not on
-your machine. Open this repo in a GitHub Codespace and follow
-[`docs/codespaces.md`](docs/codespaces.md) for the full walkthrough
-(port forwarding, why the frontend needs a special API URL in the cloud, and
-how to make the app reviewable by someone else). Short version:
+```text
+POST /auth/register
+POST /auth/login
+POST /auth/refresh
+POST /auth/logout
+```
+
+Security characteristics:
+
+* bcrypt password hashing with cost 12
+* Short-lived access tokens
+* Refresh tokens
+* Refresh-token rotation
+* Refresh-token reuse detection
+* Refresh tokens stored as SHA-256 hashes
+* Session revocation support
+
+The access JWT intentionally carries only:
+
+```json
+{
+  "sub": "<user-id>",
+  "type": "<token-type>"
+}
+```
+
+Organization and role information is not trusted from the JWT.
+
+---
+
+# Multi-Tenancy
+
+Every organization-owned resource is scoped to the authenticated user's organization.
+
+The client sends:
+
+```http
+X-Organization-Id: <organization-id>
+```
+
+The header is treated only as a selector.
+
+The server then:
+
+1. Verifies the JWT.
+2. Reads the requested organization ID.
+3. Checks the user's membership in that organization.
+4. Derives the user's role from the database.
+5. Stores the verified organization context on the request.
+6. Scopes organization-owned queries server-side.
+
+This prevents a client from simply changing an organization ID and accessing another tenant's data.
+
+---
+
+# RBAC
+
+TaskFlow currently defines two organization roles:
+
+```text
+org_admin
+member
+```
+
+Administrators can perform privileged organization operations such as member management and project deletion.
+
+RBAC is enforced centrally through:
+
+```text
+middleware/role.middleware.ts
+```
+
+Routes use:
+
+```text
+requireRole(...)
+```
+
+rather than duplicating authorization logic inside individual controllers.
+
+---
+
+# Background Job Architecture
+
+Task assignment notifications use a dedicated BullMQ queue:
+
+```text
+task-assignment-notifications
+```
+
+The worker runs separately from the API:
+
+```text
+API Process
+    │
+    └── enqueue job
+             │
+             ▼
+          Redis
+             │
+             ▼
+       BullMQ Queue
+             │
+             ▼
+       Worker Process
+             │
+             ▼
+        Mock Email
+```
+
+The API does not execute notification processing inside the HTTP request handler.
+
+---
+
+# Queue Consistency Strategy
+
+Task assignment is the most consistency-sensitive asynchronous workflow.
+
+The implementation:
+
+1. Persists the task assignment.
+2. Creates a notification outbox record.
+3. Commits both atomically in PostgreSQL.
+4. Attempts to enqueue the BullMQ job.
+5. Recovers pending outbox records if immediate enqueue fails.
+
+This avoids losing the notification solely because Redis/BullMQ was temporarily unavailable after the database transaction committed.
+
+The detailed tradeoffs are documented in:
+
+```text
+docs/technical-decisions.md
+```
+
+---
+
+# Retry and Dead-Letter Queue
+
+Notification jobs use:
+
+```text
+Initial attempt
+      ↓
+Retry 1
+      ↓
+Retry 2
+      ↓
+Retry 3
+      ↓
+Dead-Letter Queue
+```
+
+There are **4 total attempts**:
+
+```text
+1 initial + 3 retries
+```
+
+Backoff:
+
+```text
+1s → 2s → 4s
+```
+
+After retry exhaustion, the job is moved to:
+
+```text
+task-assignment-notifications-dlq
+```
+
+Job status can be inspected through:
+
+```http
+GET /jobs/:id
+```
+
+---
+
+# API Documentation
+
+Swagger/OpenAPI is available at:
+
+```text
+http://localhost:3000/docs
+```
+
+When running through GitHub Codespaces, use the forwarded port-3000 URL:
+
+```text
+https://<codespace>-3000.app.github.dev/docs
+```
+
+A Postman collection is included:
+
+```text
+postman/TaskFlow.postman_collection.json
+```
+
+The collection uses variables such as:
+
+```text
+baseUrl
+accessToken
+organizationId
+projectId
+taskId
+jobId
+```
+
+The intended demo flow is:
+
+```text
+Register
+   ↓
+Login
+   ↓
+Create Project
+   ↓
+Create Task
+   ↓
+Assign Task
+   ↓
+Check Job Status
+   ↓
+View Task
+   ↓
+View Dashboard
+```
+
+---
+
+# Running with GitHub Codespaces
+
+You do not need Docker, PostgreSQL, or Redis installed on your laptop.
+
+Docker runs inside the GitHub Codespace.
+
+### Start backend services
+
+From:
+
+```text
+backend/
+```
+
+run:
 
 ```bash
-docker compose up --build      # backend: api, worker, postgres, redis
-npm run db:setup                # migrate + seed, in a second terminal
-cd frontend && npm run dev      # frontend, in a third terminal
+docker compose up --build
 ```
 
-### Option 2 — Local machine (requires Docker Desktop, or local Postgres + Redis)
+This starts:
 
-#### Prerequisites
-- Node.js 20+
-- Docker & Docker Compose (recommended path), **or** local PostgreSQL 16 + Redis 7
+```text
+API
+Worker
+PostgreSQL
+Redis
+```
 
-#### 2a — Docker Compose (recommended)
+### Apply migrations and seed data
+
+In another terminal:
+
+```bash
+npm run db:setup
+```
+
+### Start frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend runs on port:
+
+```text
+5173
+```
+
+The API runs on:
+
+```text
+3000
+```
+
+Swagger runs on:
+
+```text
+3000/docs
+```
+
+For Codespaces, forward ports `5173` and `3000` through the Codespaces Ports panel.
+
+PostgreSQL and Redis should remain private.
+
+See:
+
+```text
+docs/codespaces.md
+```
+
+for the full Codespaces setup and port-forwarding instructions.
+
+---
+
+# Local Setup
+
+## Prerequisites
+
+* Node.js 20+
+* Docker and Docker Compose
+
+or:
+
+* PostgreSQL 16
+* Redis 7
+
+### Docker Compose
+
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
-This starts `postgres`, `redis`, `api`, and `worker`. On first run, apply
-migrations and seed data from your host machine (or `docker compose exec api sh`):
+
+Then apply migrations and seed data:
+
 ```bash
 npm install
 npm run db:setup
 ```
-API: http://localhost:3000 — Swagger: http://localhost:3000/docs
 
-#### 2b — Run natively (no Docker at all)
-```bash
-npm install
-cp .env.example .env   # point DATABASE_URL/REDIS_URL at your local Postgres/Redis
-npm run db:setup
-npm run dev             # API, in one terminal
-npm run dev:worker      # worker, in another terminal
+API:
+
+```text
+http://localhost:3000
 ```
 
-### Frontend (test console) — same command either way
-Once the API is running (any option above):
+Swagger:
+
+```text
+http://localhost:3000/docs
+```
+
+---
+
+# Running Without Docker
+
+```bash
+npm install
+cp .env.example .env
+npm run db:setup
+```
+
+Start the API:
+
+```bash
+npm run dev
+```
+
+Start the worker in another terminal:
+
+```bash
+npm run dev:worker
+```
+
+---
+
+# Frontend
+
 ```bash
 cd frontend
 npm install
-cp .env.example .env    # VITE_API_URL — see docs/codespaces.md if running in the cloud
-npm run dev              # opens on http://localhost:5173 (or the forwarded URL in Codespaces)
+cp .env.example .env
+npm run dev
 ```
-Log in with a seeded account (see section 22) and you're exercising the live
-API through the UI — including the assignment → BullMQ → job-status flow,
-visualized live via the QueuePulse indicator. See
-[`frontend/README.md`](frontend/README.md) for what it covers and how it's
-designed.
 
-## 15. Environment variables
+The frontend uses:
 
-See [`.env.example`](.env.example) for the full list with comments. All are
-validated at startup by `src/config.ts` (fail-fast — the app refuses to
-start with a missing/invalid value, e.g. `BCRYPT_ROUNDS` below 12).
+```env
+VITE_API_URL=<API URL>
+```
 
-## 16. Database migration
+When running locally:
 
-Migrations are plain SQL under `prisma/migrations/`, applied via:
+```text
+http://localhost:3000
+```
+
+When running in Codespaces, configure it with the forwarded API URL.
+
+---
+
+# Environment Variables
+
+See:
+
+```text
+.env.example
+```
+
+for the complete list.
+
+Configuration is validated during application startup by:
+
+```text
+src/config.ts
+```
+
+The application fails fast when required configuration is missing or invalid.
+
+Important configuration categories include:
+
+```text
+Application
+Database
+Redis
+JWT
+Security
+Rate limiting
+Email
+```
+
+Secrets and real `.env` files are intentionally excluded from version control.
+
+---
+
+# Database Migrations
+
+Apply existing migrations:
+
 ```bash
-npx prisma migrate deploy   # production/CI: apply existing migrations
-npx prisma migrate dev      # local development: apply + create new migrations from schema changes
+npx prisma migrate deploy
 ```
 
-## 17. Seed data
+For Docker-based execution:
+
+```bash
+docker compose run --rm api npx prisma migrate deploy
+```
+
+Check migration status against the Docker database:
+
+```bash
+docker compose run --rm api npx prisma migrate status
+```
+
+For local development where schema changes need new migrations:
+
+```bash
+npx prisma migrate dev
+```
+
+---
+
+# Seed Data
+
+Run:
 
 ```bash
 npm run prisma:seed
 ```
-Creates 2 organizations, 5 users, 3 projects, 15 tasks (varied
-status/priority), assignments, and comments. See section 22 for credentials.
 
-## 18. Running API
+or:
+
 ```bash
-npm run dev          # local, hot reload
-npm run build && npm start   # production build
+npm run db:setup
 ```
 
-## 19. Running worker
-```bash
-npm run dev:worker
-npm run build && npm run start:worker
+The seed creates:
+
+* 2 organizations
+* 5 users
+* 3 projects
+* 15 tasks
+* Assignments
+* Comments
+
+---
+
+# Demo Credentials
+
+All demo accounts use:
+
+```text
+DemoPass123!
 ```
 
-## 20. Running tests
-```bash
-npm test                    # unit tests only — no DB/Redis required
-npm run test:integration    # integration tests — requires a running Postgres + Redis
-npm run test:coverage       # coverage report (bonus)
+Development-only credentials.
+
+| Organization        | Role      | Email                                                 |
+| ------------------- | --------- | ----------------------------------------------------- |
+| Nimbus Logistics    | org_admin | [admin@nimbus.example](mailto:admin@nimbus.example)   |
+| Nimbus Logistics    | member    | [member@nimbus.example](mailto:member@nimbus.example) |
+| Nimbus Logistics    | member    | [dev@nimbus.example](mailto:dev@nimbus.example)       |
+| Solace Retail Group | org_admin | [admin@solace.example](mailto:admin@solace.example)   |
+| Solace Retail Group | member    | [member@solace.example](mailto:member@solace.example) |
+
+### Multi-Tenant Isolation Demo
+
+Use two different organization admins to demonstrate tenant isolation.
+
+For example:
+
+1. Login as:
+
+```text
+admin@nimbus.example
 ```
-**Test isolation**: integration tests truncate every table before each test
-and are meant to run against a **dedicated test database** — never your dev
-database. Point `DATABASE_URL` in `.env.test` at a database named e.g.
-`taskflow_test` before running `test:integration`. See
-`docs/technical-decisions.md` → "Test isolation strategy" for why truncation
-was chosen over transaction rollback.
 
-## 21. Docker setup
-```bash
-docker compose up --build     # first run / after code changes
-docker compose down -v        # tear down, including the Postgres volume
+2. Obtain the Nimbus organization ID.
+
+3. Attempt to access a Solace resource using the Nimbus organization context.
+
+Expected behavior:
+
+```text
+403 Forbidden
 ```
-Includes health checks for all four services; `api` and `worker` wait for
-`postgres`/`redis` to be healthy before starting.
 
-## 22. Demo credentials
+The application must not expose another organization's data.
 
-All passwords: `DemoPass123!` (development-only, never use in production).
+---
 
-| Organization | Role | Email |
-|---|---|---|
-| Nimbus Logistics | org_admin | admin@nimbus.example |
-| Nimbus Logistics | member | member@nimbus.example |
-| Nimbus Logistics | member | dev@nimbus.example |
-| Solace Retail Group | org_admin | admin@solace.example |
-| Solace Retail Group | member | member@solace.example |
+# API Examples
 
-Use two different organizations' admins to demonstrate cross-tenant 403s —
-e.g. log in as `admin@nimbus.example`, note their org id, then try accessing
-a Solace project/task id with `admin@solace.example`'s token but Nimbus's org
-header (impersonation attempt → 403), or with the correct org header for a
-resource that simply doesn't exist there (→ 404, no data leaked).
+## Register
 
-## 23. API examples
-
-**Register**
 ```bash
 curl -X POST http://localhost:3000/auth/register \
   -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"StrongPass123!","fullName":"You","organizationName":"Your Org"}'
+  -d '{
+    "email":"you@example.com",
+    "password":"StrongPass123!",
+    "fullName":"You",
+    "organizationName":"Your Org"
+  }'
 ```
 
-**Create a project** (org context via header)
+---
+
+## Create Project
+
 ```bash
 curl -X POST http://localhost:3000/api/v1/projects \
   -H "Authorization: Bearer <accessToken>" \
   -H "X-Organization-Id: <organizationId>" \
   -H "Content-Type: application/json" \
-  -d '{"name":"Website Relaunch"}'
+  -d '{
+    "name":"Website Relaunch"
+  }'
 ```
 
-**Filter tasks**
+---
+
+## Filter Tasks
+
 ```bash
 curl "http://localhost:3000/api/v1/projects/<projectId>/tasks?status=in_progress&priority=high&dueFrom=2026-08-01&dueTo=2026-08-31" \
   -H "Authorization: Bearer <accessToken>" \
   -H "X-Organization-Id: <organizationId>"
 ```
 
-**Assign a task**
+---
+
+## Assign a Task
+
 ```bash
 curl -X POST http://localhost:3000/api/v1/tasks/<taskId>/assignments \
   -H "Authorization: Bearer <accessToken>" \
   -H "X-Organization-Id: <organizationId>" \
   -H "Content-Type: application/json" \
-  -d '{"userId":"<targetUserId>"}'
+  -d '{
+    "userId":"<targetUserId>"
+  }'
 ```
 
-## 24. Technical decisions
+---
 
-See [`docs/technical-decisions.md`](docs/technical-decisions.md) — every
-non-obvious choice (pagination style, retry semantics, refresh-token
-storage, CASCADE/RESTRICT rules, the assignment/queue consistency strategy,
-test isolation) explained specifically for TaskFlow, with tradeoffs stated
-rather than glossed over.
+# Health Check
 
-## 25. Assumptions
+The API exposes:
 
-- The assignment's endpoint paths (`/auth/*`, `/jobs/:id`) are preserved
-  exactly as written; other business resources use an `/api/v1` prefix per
-  general REST convention, since the PDF didn't mandate a prefix for them.
-- Registration either creates a new organization (caller becomes `org_admin`)
-  or joins an existing one by id (caller becomes `member`) — the PDF didn't
-  specify how a user's first organization membership is established, and an
-  explicit invite-code/invite-link flow was out of scope for this assignment.
-  Adding a member to an org after that point is an admin-only action
-  (`POST /api/v1/members`).
-- "3 retries" is read as 3 retries after the initial attempt (4 total),
-  matching the 3-step backoff sequence — see technical-decisions.md for the
-  reasoning, since this is genuinely ambiguous in the source text.
-- Offset pagination was chosen over cursor pagination (the PDF allows either).
+```text
+GET /health
+```
 
-## 26. Known limitations
+The health endpoint checks both PostgreSQL and Redis.
 
-- **Outbox recovery delay**: if the immediate BullMQ enqueue attempt fails,
-  notification delivery can be delayed up to ~15 seconds (grace period +
-  sweep interval) rather than being instant. This is a deliberate,
-  documented tradeoff, not an oversight — see technical-decisions.md.
-- **Soft delete does not cascade**: deleting a project soft-deletes only the
-  project row, not its tasks (though task listing/lookup already filters by
-  `project.deletedAt IS NULL`, so soft-deleted-project tasks are invisible
-  via the API either way). A stricter implementation would cascade the
-  `deletedAt` write or add a scheduled cleanup job.
-- **No refresh-token-family invalidation UI**: reuse of a revoked refresh
-  token triggers revocation of *all* of that user's sessions server-side as
-  a defensive measure, but there's no endpoint yet to notify the user this
-  happened (e.g. "you were logged out everywhere because of a suspicious
-  refresh attempt").
-- **Outbox backlog isn't independently monitored**: `/health` checks
-  Postgres/Redis connectivity, but not oldest-pending-outbox-row age — a
-  production deployment would want that as a separate signal.
-- **Verification environment constraint**: this repository's automated
-  test/build verification was performed in a network-sandboxed environment
-  that could not reach `binaries.prisma.sh` (Prisma's engine CDN), so
-  `prisma generate`/`migrate` could not be executed there. In that
-  environment, all *raw* migration SQL was instead validated directly
-  against a real local PostgreSQL 16 instance (tables, indexes, generated
-  `tsvector` column, and CASCADE/RESTRICT behavior all confirmed working —
-  see the SQL transcript in the project history), and all unit tests
-  (bcrypt hashing, JWT sign/verify, pagination helper, assignment validation
-  logic) passed against the compiled TypeScript. `npm install`, `npx tsc`,
-  and `npx vitest run tests/unit` were all executed successfully. Only the
-  Prisma CLI's own binary download was blocked — on any machine with normal
-  internet access (a reviewer's laptop, CI, or the Docker build itself),
-  `npx prisma generate` / `migrate deploy` will work normally, since
-  `binaries.prisma.sh` is a standard public endpoint.
+Expected response:
 
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": "ok",
+    "redis": "ok"
+  }
+}
+```
 
+---
 
+# Docker
 
+The backend uses a multi-stage Docker build.
 
-Organization A — Nimbus Logistics
-  admin:  admin@nimbus.example / DemoPass123!
-  member: member@nimbus.example / DemoPass123!
-Organization B — Solace Retail Group
-  admin:  admin@solace.example / DemoPass123!
-  member: member@solace.example / DemoPass123!
+The same Dockerfile produces separate:
+
+```text
+api
+worker
+```
+
+targets.
+
+Docker Compose runs:
+
+```text
+┌─────────────────────────────┐
+│        Docker Compose       │
+├─────────────────────────────┤
+│                             │
+│  ┌─────────┐   ┌─────────┐  │
+│  │   API   │   │ Worker  │  │
+│  │  :3000  │   │         │  │
+│  └────┬────┘   └────▲────┘  │
+│       │             │       │
+│       ▼             │       │
+│  ┌─────────┐   ┌────┴────┐  │
+│  │Postgres │   │  Redis  │  │
+│  │  :5432  │   │  :6379  │  │
+│  └─────────┘   └─────────┘  │
+│                             │
+└─────────────────────────────┘
+```
+
+Start:
+
+```bash
+docker compose up --build
+```
+
+Stop:
+
+```bash
+docker compose down
+```
+
+To remove containers **and the PostgreSQL volume**:
+
+```bash
+docker compose down -v
+```
+
+---
+
+# Testing
+
+### Unit Tests
+
+```bash
+npm test
+```
+
+Unit tests do not require PostgreSQL or Redis.
+
+### Integration Tests
+
+```bash
+npm run test:integration
+```
+
+Integration tests require a running PostgreSQL and Redis instance.
+
+Use a dedicated test database.
+
+Do not run integration tests against the development database.
+
+### Coverage
+
+```bash
+npm run test:coverage
+```
+
+---
+
+# Technical Decisions
+
+Detailed engineering decisions are documented in:
+
+```text
+docs/technical-decisions.md
+```
+
+The document covers:
+
+* Pagination strategy
+* Refresh-token storage
+* Token rotation
+* CASCADE / RESTRICT behavior
+* Multi-tenant isolation
+* Assignment/queue consistency
+* Retry semantics
+* Dead-letter queue
+* Test isolation
+* Outbox recovery
+
+The goal is to document not only **what** was implemented, but **why** each non-obvious decision was made and what tradeoffs were accepted.
+
+---
+
+# Requirement Mapping
+
+| Requirement         | Implementation                 |
+| ------------------- | ------------------------------ |
+| Node.js backend     | Node.js 20 + TypeScript        |
+| REST API            | Fastify                        |
+| PostgreSQL          | PostgreSQL 16                  |
+| ORM                 | Prisma                         |
+| Authentication      | JWT                            |
+| Password security   | bcrypt                         |
+| Multi-tenancy       | Organization-scoped middleware |
+| RBAC                | `org_admin` / `member`         |
+| CRUD                | Projects and tasks             |
+| Task assignment     | Assignment service             |
+| Async processing    | Redis + BullMQ                 |
+| Background worker   | Separate worker process        |
+| Notifications       | Mock email                     |
+| Retry               | Exponential backoff            |
+| DLQ                 | Dedicated BullMQ DLQ           |
+| Job status          | `GET /jobs/:id`                |
+| API documentation   | Swagger + Postman              |
+| Containerization    | Docker + Docker Compose        |
+| Database migrations | Prisma migrations              |
+| Testing             | Vitest                         |
+| Frontend demo       | React + Vite + Tailwind        |
+| Cloud development   | GitHub Codespaces              |
+
+---
+
+# Assumptions
+
+The following implementation decisions were made where the assignment specification was ambiguous:
+
+1. Assignment-mandated endpoint paths such as `/auth/*` and `/jobs/:id` are preserved exactly.
+
+2. Business resources use the `/api/v1` prefix as a conventional REST API structure.
+
+3. Registration can create a new organization, making the caller an `org_admin`, or join an existing organization by ID as a `member`.
+
+4. Adding members after organization creation is an administrator-only operation.
+
+5. "3 retries" is interpreted as 3 retries after the initial attempt, resulting in 4 total attempts.
+
+6. Offset pagination is used because the assignment allows either offset or cursor pagination.
+
+---
+
+# Known Limitations
+
+### Outbox Recovery Delay
+
+If the immediate BullMQ enqueue attempt fails, notification delivery can be delayed by the recovery sweep interval rather than being instantaneous.
+
+This is a deliberate consistency tradeoff.
+
+### Soft Delete Behavior
+
+Soft-deleting a project does not physically delete its tasks.
+
+Tasks belonging to soft-deleted projects are excluded from API visibility.
+
+### Refresh Token Family UI
+
+Server-side defensive revocation exists for refresh-token reuse detection, but there is no dedicated user-facing endpoint that reports that all sessions were revoked because of suspicious refresh-token reuse.
+
+### Outbox Monitoring
+
+The `/health` endpoint checks PostgreSQL and Redis connectivity but does not independently monitor the age of the oldest pending outbox record.
+
+A production deployment would benefit from a dedicated outbox backlog/age metric.
+
+---
+
+# API Endpoint Overview
+
+## Authentication
+
+```text
+POST   /auth/register
+POST   /auth/login
+POST   /auth/refresh
+POST   /auth/logout
+```
+
+## Organizations
+
+```text
+GET    /api/v1/organizations
+POST   /api/v1/organizations
+...
+```
+
+## Members
+
+```text
+GET    /api/v1/members
+POST   /api/v1/members
+...
+```
+
+## Projects
+
+```text
+GET    /api/v1/projects
+POST   /api/v1/projects
+GET    /api/v1/projects/:id
+PATCH  /api/v1/projects/:id
+DELETE /api/v1/projects/:id
+```
+
+## Tasks
+
+```text
+GET    /api/v1/tasks
+POST   /api/v1/tasks
+GET    /api/v1/tasks/:id
+PATCH  /api/v1/tasks/:id
+DELETE /api/v1/tasks/:id
+```
+
+## Task Assignments
+
+```text
+POST   /api/v1/tasks/:taskId/assignments
+DELETE /api/v1/tasks/:taskId/assignments/:userId
+```
+
+## Jobs
+
+```text
+GET    /jobs/:id
+```
+
+## Health
+
+```text
+GET    /health
+```
+
+For the complete API contract, use the Swagger documentation.
+
+---
+
+# Engineering Principles
+
+The implementation follows several principles throughout the backend:
+
+* Keep controllers thin.
+* Keep business rules inside services.
+* Keep database access inside repositories.
+* Treat PostgreSQL as the source of truth.
+* Never trust tenant or role information supplied by the client.
+* Keep asynchronous work outside the HTTP request lifecycle.
+* Make queue processing retryable.
+* Provide a dead-letter path for permanently failed jobs.
+* Validate configuration at startup.
+* Keep authentication and authorization separate.
+* Document assumptions and known limitations explicitly.
+* Prefer explicit failure handling over silent failure.
+
+---
+
+# Submission
+
+### GitHub Repository
+
+```text
+https://github.com/mdShakil2004/taskflow
+```
+
+### Demo
+
+```text
+https://youtu.be/unS2rHzq0lY
+```
+
+### Documentation
+
+```text
+docs/architecture.md
+docs/database.md
+docs/technical-decisions.md
+docs/requirement-checklist.md
+```
+
+### API Documentation
+
+```text
+Swagger: /docs
+Postman: postman/TaskFlow.postman_collection.json
+```
+
+---
+
+## Built for the GrubPac Technologies Backend Developer Assignment
+
+TaskFlow is implemented as a complete backend-focused system with a working React test console, containerized infrastructure, persistent PostgreSQL storage, Redis/BullMQ asynchronous processing, authentication, multi-tenancy, RBAC, API documentation, migrations, seed data, tests, and architecture documentation.
