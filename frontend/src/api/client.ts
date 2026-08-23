@@ -59,7 +59,17 @@ async function tryRefresh(): Promise<boolean> {
 }
 
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {};
+
+  // Only declare a JSON content-type when a body is actually being sent.
+  // Fastify's default JSON body parser rejects a request that claims
+  // Content-Type: application/json but sends zero bytes (FST_ERR_CTP_EMPTY_
+  // JSON_BODY) — which every bodyless DELETE (unassign, delete task/project,
+  // remove member) was doing before this fix, since this header used to be
+  // set unconditionally regardless of method/body.
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
 
   if (!options.skipAuthHeader) {
     const token = storage.getAccessToken();
