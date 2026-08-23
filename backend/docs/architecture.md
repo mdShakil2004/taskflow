@@ -1,47 +1,49 @@
-# TaskFlow — Architecture
+## Architecture
 
-## System architecture
+### System Architecture
 
 ```mermaid
 flowchart TD
-    Client[Client / Postman / Swagger UI]
-    API[Fastify API]
-    PG[(PostgreSQL)]
-    Redis[(Redis)]
-    Worker[BullMQ Worker]
-    Email[Mock Email Sender]
+    Client["Client / Postman / Swagger UI"]
+    API["Fastify API"]
+    PG[("PostgreSQL")]
+    Redis[("Redis")]
+    Worker["BullMQ Worker"]
+    Email["Mock Email Sender"]
 
     Client -->|HTTPS + JWT| API
     API -->|Prisma| PG
-    API -->|enqueue job| Redis
-    Redis -->|deliver job| Worker
+    API -->|Enqueue Job| Redis
+    Redis -->|Deliver Job| Worker
     Worker -->|Prisma| PG
     Worker --> Email
 ```
 
-The API and worker are two separate Node.js processes (two separate Docker
-images built from the same codebase via multi-stage build targets). The API
-never runs the worker in-process — the assignment endpoint enqueues a job and
-returns immediately; the worker consumes it independently. This means the API
-can be scaled, restarted, or briefly unavailable without the worker's
-processing loop being affected, and vice versa.
+The API and worker are separate Node.js processes and separate Docker services built from the same codebase using multi-stage Docker targets.
 
-## Request → response layering
+The API never runs the worker in-process. Task assignment enqueues a background job and returns without waiting for notification processing. The worker consumes jobs independently.
 
-Every route follows the same layering, so business logic is never scattered
-across controllers:
+This separation allows the API and worker to be restarted, scaled, or operated independently.
+
+---
+
+### Request → Response Layering
+
+Every API route follows the same application layering:
 
 ```mermaid
 flowchart LR
-    Route --> Controller --> Service --> Repository --> Prisma[(PostgreSQL via Prisma)]
+    Route --> Controller --> Service --> Repository --> Prisma[("PostgreSQL via Prisma")]
 ```
 
-- **Routes** wire URLs to controllers and attach `preHandler` hooks (auth, tenant context, RBAC).
-- **Controllers** parse/validate the request (Zod) and map the service result to an HTTP response. No business rules live here.
-- **Services** own business rules: what counts as a duplicate assignment, who can delete a project, how a dashboard is computed.
-- **Repositories** are the only files that call Prisma directly.
+* **Routes** — Define URLs and attach authentication, tenant-context, and RBAC hooks.
+* **Controllers** — Parse and validate requests using Zod and map service results to HTTP responses. Business rules do not live here.
+* **Services** — Own business rules such as duplicate assignment detection, project deletion authorization, and dashboard calculations.
+* **Repositories** — The only application layer that directly accesses Prisma.
 
-## Authentication flow
+---
+
+### Authentication Flow
 
 ```mermaid
 sequenceDiagram
@@ -50,36 +52,45 @@ sequenceDiagram
     participant DB as PostgreSQL
 
     C->>A: POST /auth/register or /auth/login
-    A->>DB: verify/create user (bcrypt hash, cost 12)
-    A->>DB: store refresh token (SHA-256 hash, 7d TTL)
-    A-->>C: access token (JWT, 15m) + refresh token
+    A->>DB: Verify/create user (bcrypt, cost 12)
+    A->>DB: Store refresh token (SHA-256 hash, 7d TTL)
+    A-->>C: Access token (JWT, 15m) + refresh token
 
-    C->>A: Any request with Authorization: Bearer <access token>
-    A->>A: verify JWT signature + expiry
-    C->>A: X-Organization-Id header selects org context
-    A->>DB: look up org_members(org, user) -> role
-    A-->>C: 403 if no membership row exists; otherwise proceed
+    C->>A: Request with Authorization: Bearer <access token>
+    A->>A: Verify JWT signature + expiry
+
+    C->>A: X-Organization-Id header
+    A->>DB: Lookup org_members(user, organization) → role
+    A-->>C: 403 if no membership; otherwise proceed
 ```
 
-## Multi-tenant authorization flow
+The access token contains the user identity required for authentication. Organization membership and role are resolved server-side from PostgreSQL.
+
+---
+
+### Multi-Tenant Authorization Flow
 
 ```mermaid
 flowchart TD
-    JWT["JWT access token (sub = userId only)"] --> Header["X-Organization-Id header (client-selected, untrusted)"]
-    Header --> Lookup["DB lookup: org_members WHERE org_id + user_id"]
-    Lookup -->|no row| Forbidden[403 Forbidden]
-    Lookup -->|row found| Context["request.auth = { userId, organizationId, role } — all server-derived"]
-    Context --> ScopedQuery["Every repository query includes organizationId from request.auth"]
-    ScopedQuery --> Resource[(Org-owned resource)]
+    JWT["JWT Access Token<br/>sub = userId"] --> Header["X-Organization-Id<br/>Client-selected, untrusted"]
+    Header --> Lookup["Database Lookup<br/>org_members WHERE org_id + user_id"]
+
+    Lookup -->|No Membership| Forbidden["403 Forbidden"]
+    Lookup -->|Membership Found| Context["Verified Request Context<br/>userId + organizationId + role"]
+
+    Context --> ScopedQuery["Repository Queries<br/>Scoped by organizationId"]
+    ScopedQuery --> Resource[("Organization-owned Resource")]
 ```
 
-The organization id in the header is only a *selector* telling the API which
-of the user's organizations they want to act as. Authorization never comes
-from that header value directly — it comes from the database lookup that
-follows it. A user who is not actually a member of the selected org gets 403
-regardless of what the header says.
+The `X-Organization-Id` header is only a selector indicating which organization the user wants to operate against.
 
-## Assignment → notification flow
+It is **not** treated as an authorization decision.
+
+Authorization is established through the database membership lookup. A user who is not a member of the selected organization receives `403 Forbidden`, regardless of the organization ID supplied by the client.
+
+---
+
+### Task Assignment → Notification Flow
 
 ```mermaid
 sequenceDiagram
@@ -90,41 +101,185 @@ sequenceDiagram
     participant W as Worker
 
     C->>A: POST /tasks/:id/assignments
-    A->>DB: verify task in org, assignee in org, no duplicate
-    A->>DB: BEGIN TX: create TaskAssignment + NotificationOutbox(pending) ; COMMIT
-    A->>Q: attempt immediate enqueue (best effort)
-    alt enqueue succeeds
-        A->>DB: mark outbox row dispatched
+
+    A->>DB: Verify task, organization and assignee
+    A->>DB: BEGIN TX
+    A->>DB: Create TaskAssignment
+    A->>DB: Create NotificationOutbox(pending)
+    A->>DB: COMMIT
+
+    A->>Q: Attempt immediate enqueue
+
+    alt Enqueue succeeds
+        A->>DB: Mark outbox row dispatched
         A-->>C: 201 { assignment, jobId }
-    else enqueue fails
+    else Enqueue fails
         A-->>C: 201 { assignment, jobId: null }
-        Note over A,DB: assignment is still committed — nothing rolls back
+        Note over A,DB: Assignment remains committed
     end
 
-    loop every 10s
-        W->>DB: find outbox rows still pending after grace period
-        W->>Q: enqueue any recovered rows
+    loop Every 10 seconds
+        W->>DB: Find pending outbox rows
+        W->>Q: Enqueue recovered rows
     end
 
-    Q->>W: deliver job
-    W->>W: send mock email
-    alt success
-        W->>DB: mark outbox dispatched
-    else fails after 4 attempts (1 initial + 3 retries, 1s/2s/4s backoff)
-        W->>Q: push to dead-letter queue
-        W->>DB: mark outbox failed
+    Q->>W: Deliver notification job
+    W->>W: Send mock email
+
+    alt Processing succeeds
+        W->>DB: Mark outbox dispatched
+    else Processing fails after 4 attempts
+        W->>Q: Push to dead-letter queue
+        W->>DB: Mark outbox failed
     end
 ```
 
-See `docs/technical-decisions.md` for the full rationale behind this
-consistency strategy, including what Postgres+Redis do *not* guarantee.
+See [`docs/technical-decisions.md`](technical-decisions.md) for the detailed rationale behind the consistency strategy and the guarantees provided by PostgreSQL and Redis.
 
-## Background job architecture
+---
 
-- **Queue**: `task-assignment-notifications` (BullMQ, backed by Redis).
-- **Producer**: the assignment service, immediately after committing the DB transaction.
-- **Consumer**: the worker process, running `processAssignmentNotification`.
-- **Retry policy**: 4 total attempts (1 initial + 3 retries), exponential backoff 1s → 2s → 4s.
-- **Dead-letter queue**: `task-assignment-notifications-dlq`, a separate BullMQ queue populated when a job's `failed` event fires after attempts are exhausted.
-- **Recovery**: a 10-second interval sweep in the worker publishes any `NotificationOutbox` row still `pending` after a 5-second grace period, covering the case where the API's immediate enqueue attempt failed.
-- **Global rate limit (bonus)**: the worker is configured with BullMQ's `limiter: { max: 50, duration: 60000 }`, which is coordinated through Redis — so running multiple worker instances still caps total throughput at 50/min rather than 50/min *per worker*.
+## Background Job Architecture
+
+### Queue
+
+```text
+task-assignment-notifications
+```
+
+BullMQ queue backed by Redis.
+
+### Producer
+
+The task assignment service creates the notification job after the database transaction commits.
+
+### Consumer
+
+The dedicated worker process consumes the queue and executes:
+
+```text
+processAssignmentNotification
+```
+
+### Retry Policy
+
+```text
+Initial attempt
+      ↓
+Retry #1 — 1s
+      ↓
+Retry #2 — 2s
+      ↓
+Retry #3 — 4s
+      ↓
+Dead-Letter Queue
+```
+
+There are **4 total attempts**:
+
+```text
+1 initial + 3 retries
+```
+
+### Dead-Letter Queue
+
+```text
+task-assignment-notifications-dlq
+```
+
+After all attempts are exhausted, the failed notification is moved to the dedicated dead-letter queue.
+
+### Outbox Recovery
+
+The worker performs a recovery sweep every **10 seconds**.
+
+It searches for `NotificationOutbox` records that remain `pending` after a **5-second grace period** and republishes them to BullMQ.
+
+This covers the failure case where the database transaction succeeds but the API's immediate queue enqueue attempt fails.
+
+### Global Queue Rate Limit
+
+The worker uses BullMQ's global limiter:
+
+```text
+max: 50
+duration: 60000
+```
+
+The limit is coordinated through Redis, so multiple worker instances share the throughput limit rather than each instance independently processing 50 jobs per minute.
+
+---
+
+## Deployment Architecture
+
+```mermaid
+flowchart TB
+    subgraph Docker["Docker Compose"]
+        API["API Container<br/>Fastify :3000"]
+        Worker["Worker Container<br/>BullMQ"]
+        PG[("PostgreSQL 16<br/>:5432")]
+        Redis[("Redis 7<br/>:6379")]
+    end
+
+    Browser["React / Browser"]
+    
+    Browser -->|HTTP| API
+    API -->|Prisma| PG
+    API -->|BullMQ| Redis
+    Redis --> Worker
+    Worker -->|Prisma| PG
+```
+
+The API and worker use separate Docker services while sharing the same PostgreSQL and Redis infrastructure.
+
+PostgreSQL and Redis are internal infrastructure services and are not required to be exposed to the browser.
+
+---
+
+## Design Summary
+
+```text
+                         ┌──────────────────┐
+                         │  React / Client   │
+                         └────────┬─────────┘
+                                  │
+                                  ▼
+                         ┌──────────────────┐
+                         │   Fastify API    │
+                         │                  │
+                         │ Auth / RBAC      │
+                         │ Multi-tenancy    │
+                         │ Business Logic   │
+                         └───────┬───┬──────┘
+                                 │   │
+                       Prisma    │   │ BullMQ
+                                 │   │
+                                 ▼   ▼
+                        ┌─────────┐ ┌─────────┐
+                        │Postgres │ │  Redis  │
+                        └─────────┘ └────┬────┘
+                                         │
+                                         ▼
+                                  ┌─────────────┐
+                                  │    Worker   │
+                                  │             │
+                                  │ Notifications│
+                                  │ Retry / DLQ │
+                                  └──────┬──────┘
+                                         │
+                                         ▼
+                                  ┌─────────────┐
+                                  │ Mock Email  │
+                                  └─────────────┘
+```
+
+### Core architectural properties
+
+* **API and worker are independently deployable processes.**
+* **PostgreSQL is the source of truth for application state.**
+* **Redis/BullMQ handles asynchronous notification processing.**
+* **Authorization is resolved server-side from organization membership.**
+* **Repository queries are organization-scoped.**
+* **Task assignment and outbox creation are committed transactionally.**
+* **Failed queue submission can be recovered by the worker.**
+* **Notification processing supports retries and a dead-letter queue.**
+* **The HTTP request does not wait for background notification processing.**
