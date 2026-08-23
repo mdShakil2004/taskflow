@@ -6,6 +6,18 @@ TaskFlow provides organization-scoped project and task management with secure au
 
 ---
 
+## Documentation
+
+Detailed engineering documentation is available in the repository:
+
+| Document | Description |
+|---|---|
+| [Architecture](backend/docs/architecture.md) | System architecture, request flow, authentication, multi-tenancy, and background job architecture |
+| [Codespaces Guide](backend/docs/codespaces.md) | Run the complete TaskFlow stack in GitHub Codespaces |
+| [Database Design](backend/docs/database.md) | ER diagram, table responsibilities, constraints, indexes, and deletion behavior |
+| [Implementation Plan](backend/docs/implementation-plan.md) | Assignment requirements, implementation phases, and engineering decisions |
+| [Requirement Checklist](backend/docs/requirement-checklist.md) | Requirement-by-requirement implementation checklist |
+| [Technical Decisions](backend/docs/technical-decisions.md) | Key architectural decisions, trade-offs, consistency strategy, security, and design rationale |
 
 ## 🎥 Working Demo
 
