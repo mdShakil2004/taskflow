@@ -61,6 +61,43 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Cross-tab session sync. localStorage is shared across every tab on the
+  // same origin, but React state is per-tab. Without this, logging in (or
+  // out) in one tab silently changes which session subsequent API requests
+  // in OTHER open tabs actually use (apiRequest reads the token fresh from
+  // localStorage at send-time) while those tabs' UI keeps showing the old
+  // user/role — exactly the confusing "403 despite the sidebar saying
+  // org_admin" scenario. The native `storage` event fires in every tab
+  // *except* the one that made the change, so we re-sync this tab's state
+  // to match whatever localStorage now actually holds.
+  useEffect(() => {
+    function handleStorageChange(event: StorageEvent) {
+      if (event.key !== null && !event.key.startsWith("taskflow.")) return;
+
+      const token = storage.getAccessToken();
+      if (!token) {
+        // Another tab logged out (or session was cleared) — mirror that here.
+        setUser(null);
+        setOrganizations([]);
+        setCurrentOrganizationId(null);
+        return;
+      }
+
+      // Another tab logged in as a different session, or switched org —
+      // reload this tab's user/org state to match what's now authoritative.
+      setUser(storage.getUser<User>());
+      setCurrentOrganizationId(storage.getOrganizationId());
+      loadOrganizations().catch(() => {
+        storage.clear();
+        setUser(null);
+      });
+    }
+
+    window.addEventListener("storage", handleStorageChange);
+    return () => window.removeEventListener("storage", handleStorageChange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const login = useCallback(async (email: string, password: string) => {
     const result = await authApi.login({ email, password });
     storage.setSession(result);
