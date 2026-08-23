@@ -1,7 +1,7 @@
 import { storage } from "../lib/storage";
 import type { ApiErrorBody } from "./types";
 
-const BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+const BASE_URL = import.meta.env.VITE_API_URL ?? "https://zany-eureka-pj99qrqwgx5344p-3000.app.github.dev";
 
 export class ApiError extends Error {
   code: string;
