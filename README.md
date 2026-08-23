@@ -6,7 +6,6 @@ TaskFlow provides organization-scoped project and task management with secure au
 
 ---
 
-## 🎥 Working Demo
 
 ## 🎥 Working Demo
 
